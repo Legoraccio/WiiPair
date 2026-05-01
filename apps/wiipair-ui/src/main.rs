@@ -1,6 +1,6 @@
 use eframe::egui;
 use std::collections::VecDeque;
-use wiimote_core::{Accelerometer, Buttons, IrDots};
+use wiimote_core::{Accelerometer, Buttons, ExtensionType, IrDots};
 use wiimote_daemon::{Daemon, DeviceSnapshot, LogLevel, UiCommand, UiEvent};
 
 fn main() -> eframe::Result {
@@ -71,33 +71,35 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.heading("WiiPair");
                 ui.label(egui::RichText::new("·").weak());
-                ui.label("scan ogni 2 s");
+                ui.label("scanning every 2 s");
             });
         });
 
-        egui::TopBottomPanel::bottom("log").resizable(true).show(ctx, |ui| {
-            ui.label(egui::RichText::new("Log").strong());
-            egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
-                for line in &self.log {
-                    let color = match line.level {
-                        LogLevel::Info => egui::Color32::LIGHT_GRAY,
-                        LogLevel::Warn => egui::Color32::YELLOW,
-                        LogLevel::Error => egui::Color32::LIGHT_RED,
-                    };
-                    ui.colored_label(color, &line.text);
-                }
+        egui::TopBottomPanel::bottom("log")
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new("Log").strong());
+                egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                    for line in &self.log {
+                        let color = match line.level {
+                            LogLevel::Info => egui::Color32::LIGHT_GRAY,
+                            LogLevel::Warn => egui::Color32::YELLOW,
+                            LogLevel::Error => egui::Color32::LIGHT_RED,
+                        };
+                        ui.colored_label(color, &line.text);
+                    }
+                });
             });
-        });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.devices.is_empty() {
                 ui.add_space(20.0);
                 ui.vertical_centered(|ui| {
-                    ui.label("Nessun Wiimote rilevato.");
+                    ui.label("No Wiimote detected.");
                     ui.label(
-                        "Pair via Impostazioni Bluetooth di Windows. \
-                         Premi 1+2 sul Wiimote per metterlo in discovery; \
-                         in pairing scegli 'Senza codice'.",
+                        "Pair via Windows Bluetooth Settings. \
+                         Press 1+2 on the Wiimote to enter discovery; \
+                         in the pairing dialog choose 'No PIN'.",
                     );
                 });
                 return;
@@ -114,6 +116,12 @@ impl eframe::App for App {
                         };
                         ui.colored_label(dot_color, dot);
                         ui.strong(&d.name);
+                        if let Some(ext) = d.extension {
+                            ui.label(
+                                egui::RichText::new(format!("· {}", ext.label()))
+                                    .color(extension_color(ext)),
+                            );
+                        }
                         ui.label(
                             egui::RichText::new(short(&d.id, 24))
                                 .monospace()
@@ -124,15 +132,16 @@ impl eframe::App for App {
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
                                 if d.connected {
-                                    if ui.button("Disconnetti").clicked() {
+                                    if ui.button("Disconnect").clicked() {
                                         let _ = self.daemon.commands_tx.send(
                                             UiCommand::Disconnect(d.id.clone()),
                                         );
                                     }
-                                } else if ui.button("Connetti").clicked() {
-                                    let _ = self.daemon.commands_tx.send(
-                                        UiCommand::Connect(d.id.clone()),
-                                    );
+                                } else if ui.button("Connect").clicked() {
+                                    let _ = self
+                                        .daemon
+                                        .commands_tx
+                                        .send(UiCommand::Connect(d.id.clone()));
                                 }
                             },
                         );
@@ -141,12 +150,12 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         if let Some(b) = d.battery {
                             let pct = (b as f32) / 255.0 * 100.0;
-                            ui.label(format!("Batteria: {pct:.0}%"));
+                            ui.label(format!("Battery: {pct:.0}%"));
                         } else {
-                            ui.label("Batteria: —");
+                            ui.label("Battery: —");
                         }
                         ui.separator();
-                        ui.label(format!("Tasti: {}", buttons_str(d.last_buttons)));
+                        ui.label(format!("Buttons: {}", buttons_str(d.last_buttons)));
                     });
                     ui.horizontal(|ui| {
                         ui.label(
@@ -182,6 +191,19 @@ fn short(s: &str, max: usize) -> String {
     } else {
         let tail = &s[s.len() - max..];
         format!("…{tail}")
+    }
+}
+
+fn extension_color(ext: ExtensionType) -> egui::Color32 {
+    match ext {
+        ExtensionType::Guitar => egui::Color32::from_rgb(255, 170, 80),
+        ExtensionType::Drums => egui::Color32::from_rgb(120, 200, 255),
+        ExtensionType::DjHeroTurntable => egui::Color32::from_rgb(220, 120, 255),
+        ExtensionType::Nunchuk
+        | ExtensionType::ClassicController
+        | ExtensionType::ClassicControllerPro
+        | ExtensionType::MotionPlus => egui::Color32::from_rgb(180, 220, 180),
+        _ => egui::Color32::LIGHT_GRAY,
     }
 }
 

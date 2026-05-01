@@ -12,12 +12,13 @@
 //!   again.
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::thread;
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use wiimote_core::{
-    Accelerometer, Buttons, InputReport, IrDots, OutputReport, PID_WIIMOTE, VID_NINTENDO,
+    Accelerometer, Buttons, ExtensionType, InputReport, IrDots, OutputReport, PID_WIIMOTE,
+    VID_NINTENDO,
 };
 use wiimote_output::{ControllerState, Output, default_output};
 use wiimote_transport::hid::HidTransport;
@@ -36,14 +37,29 @@ pub struct DeviceSnapshot {
     pub id: String,
     pub name: String,
     pub connected: bool,
-    /// Set when the user explicitly clicked "Disconnetti" — auto-retry
-    /// stays off until they click "Connetti" again. Cleared on Connect.
+    /// Set when the user explicitly clicked "Disconnect" — auto-retry
+    /// stays off until they click "Connect" again. Cleared on Connect.
     pub user_disabled: bool,
     pub last_buttons: Buttons,
     pub last_accel: Accelerometer,
     pub last_ir: IrDots,
     pub battery: Option<u8>,
+    /// Type of extension plugged into the Wiimote (Nunchuk, guitar, …).
+    /// `None` until the post-status init dance completes, or after the
+    /// extension is unplugged.
+    pub extension: Option<ExtensionType>,
     pub last_error: Option<String>,
+}
+
+/// Per-device state machine for extension identification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtensionPhase {
+    /// We've sent the "0x55 to 0xa400f0" init write; awaiting Ack 0x22.
+    InitSent,
+    /// Init acked, we've requested the 6-byte ID; awaiting ReadResponse 0x21.
+    ReadingId,
+    /// Identified — won't redo unless extension is unplugged.
+    Identified(ExtensionType),
 }
 
 #[derive(Debug, Clone)]
@@ -113,8 +129,14 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
     let mut devices: HashMap<String, DeviceSnapshot> = HashMap::new();
     let mut states: HashMap<String, ControllerState> = HashMap::new();
     let mut outputs: HashMap<String, Box<dyn Output>> = HashMap::new();
+    // HID handle is open but no first input report has arrived yet —
+    // on Windows hidapi.open() succeeds even for paired-but-offline
+    // Wiimotes, so opening alone is not proof of connectivity.
+    let mut pending: HashSet<String> = HashSet::new();
     // Earliest moment at which we'll try opening a given device again.
     let mut next_retry: HashMap<String, Instant> = HashMap::new();
+    // Extension identification finite-state machine, per device.
+    let mut ext_phase: HashMap<String, ExtensionPhase> = HashMap::new();
 
     let scan_interval = Duration::from_secs(2);
     let mut last_scan = Instant::now()
@@ -138,7 +160,14 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
                         d.user_disabled = false;
                     }
                     next_retry.remove(&id);
-                    if try_connect(&id, &mut devices, &mut hid, &mut outputs, &events_tx) {
+                    if try_connect(
+                        &id,
+                        &mut devices,
+                        &mut hid,
+                        &mut outputs,
+                        &mut pending,
+                        &events_tx,
+                    ) {
                         dirty = true;
                     } else {
                         next_retry.insert(id.clone(), Instant::now() + RETRY_INTERVAL);
@@ -147,9 +176,12 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
                 UiCommand::Disconnect(id) => {
                     let _ = hid.close(&DeviceId(id.clone()));
                     outputs.remove(&id);
+                    pending.remove(&id);
+                    ext_phase.remove(&id);
                     if let Some(d) = devices.get_mut(&id) {
                         d.connected = false;
                         d.user_disabled = true;
+                        d.extension = None;
                     }
                     next_retry.remove(&id);
                     dirty = true;
@@ -233,6 +265,7 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
                                     last_accel: Accelerometer::default(),
                                     last_ir: IrDots::default(),
                                     battery: None,
+                                    extension: None,
                                     last_error: None,
                                 },
                             );
@@ -247,19 +280,28 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
             }
 
             // Try (re)connecting any device that is known, idle, allowed
-            // to auto-connect, and past its cooldown.
+            // to auto-connect, not already mid-handshake, and past its
+            // cooldown.
             let now = Instant::now();
             let candidates: Vec<String> = devices
                 .iter()
                 .filter(|(id, snap)| {
                     !snap.connected
                         && !snap.user_disabled
+                        && !pending.contains(id.as_str())
                         && next_retry.get(id.as_str()).is_none_or(|t| *t <= now)
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in candidates {
-                if try_connect(&id, &mut devices, &mut hid, &mut outputs, &events_tx) {
+                if try_connect(
+                    &id,
+                    &mut devices,
+                    &mut hid,
+                    &mut outputs,
+                    &mut pending,
+                    &events_tx,
+                ) {
                     next_retry.remove(&id);
                     dirty = true;
                 } else {
@@ -272,6 +314,117 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
         while let Ok(ev) = transport_rx.try_recv() {
             match ev {
                 TransportEvent::Report { id, report } => {
+                    // First report after a tentative open confirms the
+                    // device is really online — promote it to connected.
+                    if pending.remove(&id.0) {
+                        if let Some(d) = devices.get_mut(&id.0) {
+                            d.connected = true;
+                            d.last_error = None;
+                            let _ = events_tx.send(UiEvent::Log {
+                                level: LogLevel::Info,
+                                message: format!(
+                                    "connected: {} ({})",
+                                    d.name,
+                                    short_id(&id.0)
+                                ),
+                            });
+                        }
+                        dirty = true;
+                    }
+
+                    // Extension identification FSM ---------------------
+                    match &report {
+                        InputReport::Status { flags, .. } => {
+                            if flags.extension_connected {
+                                let already = matches!(
+                                    ext_phase.get(&id.0),
+                                    Some(ExtensionPhase::Identified(_))
+                                        | Some(ExtensionPhase::InitSent)
+                                        | Some(ExtensionPhase::ReadingId)
+                                );
+                                if !already {
+                                    let _ = hid.send(
+                                        &id,
+                                        &OutputReport::WriteRegister {
+                                            address: 0x00a4_00f0,
+                                            data: vec![0x55],
+                                        }
+                                        .encode(),
+                                    );
+                                    ext_phase.insert(
+                                        id.0.clone(),
+                                        ExtensionPhase::InitSent,
+                                    );
+                                }
+                            } else {
+                                ext_phase.remove(&id.0);
+                                if let Some(d) = devices.get_mut(&id.0) {
+                                    if d.extension.is_some() {
+                                        d.extension = None;
+                                        dirty = true;
+                                    }
+                                }
+                            }
+                        }
+                        InputReport::Ack {
+                            report_id, error, ..
+                        } => {
+                            if *report_id == 0x16
+                                && *error == 0
+                                && ext_phase.get(&id.0)
+                                    == Some(&ExtensionPhase::InitSent)
+                            {
+                                let _ = hid.send(
+                                    &id,
+                                    &OutputReport::ReadRegister {
+                                        address: 0x00a4_00fa,
+                                        count: 6,
+                                    }
+                                    .encode(),
+                                );
+                                ext_phase.insert(
+                                    id.0.clone(),
+                                    ExtensionPhase::ReadingId,
+                                );
+                            }
+                        }
+                        InputReport::ReadResponse {
+                            error,
+                            size,
+                            address,
+                            data,
+                            ..
+                        } => {
+                            if *error == 0
+                                && *address == 0x00fa
+                                && *size == 6
+                                && ext_phase.get(&id.0)
+                                    == Some(&ExtensionPhase::ReadingId)
+                            {
+                                let mut id_bytes = [0u8; 6];
+                                id_bytes.copy_from_slice(&data[..6]);
+                                let ext = ExtensionType::from_id(&id_bytes);
+                                ext_phase.insert(
+                                    id.0.clone(),
+                                    ExtensionPhase::Identified(ext),
+                                );
+                                if let Some(d) = devices.get_mut(&id.0) {
+                                    d.extension = Some(ext);
+                                    dirty = true;
+                                }
+                                let _ = events_tx.send(UiEvent::Log {
+                                    level: LogLevel::Info,
+                                    message: format!(
+                                        "extension on {}: {}",
+                                        short_id(&id.0),
+                                        ext.label()
+                                    ),
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+
                     let (buttons, accel, ir, battery) = decompose(&report);
                     if let Some(b) = buttons {
                         if let Some(d) = devices.get_mut(&id.0) {
@@ -308,36 +461,48 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
                     }
                 }
                 TransportEvent::DeviceLost(id) => {
+                    let was_connected =
+                        devices.get(&id.0).map(|d| d.connected).unwrap_or(false);
                     if let Some(d) = devices.get_mut(&id.0) {
-                        if d.connected {
+                        if was_connected {
                             let _ = events_tx.send(UiEvent::Log {
                                 level: LogLevel::Info,
                                 message: format!("device offline: {}", short_id(&id.0)),
                             });
                         }
                         d.connected = false;
+                        d.extension = None;
                     }
+                    pending.remove(&id.0);
                     outputs.remove(&id.0);
                     states.remove(&id.0);
-                    // Quick retry — common case is the user briefly
-                    // toggling the Wiimote off and back on.
-                    next_retry.insert(id.0, Instant::now() + QUICK_RETRY_AFTER_LOSS);
+                    ext_phase.remove(&id.0);
+                    // The io_loop has exited; clean up its handle entry
+                    // in the transport so the next `try_connect` spawns
+                    // a fresh thread instead of short-circuiting on the
+                    // dead-but-still-present handle.
+                    let _ = hid.close(&id);
+                    // After a real disconnect, retry quickly — likely the
+                    // user is toggling the Wiimote off-and-on. After a
+                    // tentative open that never produced a report, the
+                    // device is genuinely off; back off for longer to
+                    // avoid burning cycles re-opening the empty handle.
+                    let cooldown = if was_connected {
+                        QUICK_RETRY_AFTER_LOSS
+                    } else {
+                        RETRY_INTERVAL
+                    };
+                    next_retry.insert(id.0, Instant::now() + cooldown);
                     dirty = true;
                 }
                 TransportEvent::DeviceFound(_) => {}
                 TransportEvent::Error { id, error } => {
-                    let msg = format!("transport error: {error}");
-                    warn!(?id, "{msg}");
-                    if let Some(idv) = id {
-                        if let Some(d) = devices.get_mut(&idv.0) {
-                            d.last_error = Some(msg.clone());
-                            dirty = true;
-                        }
-                    }
-                    let _ = events_tx.send(UiEvent::Log {
-                        level: LogLevel::Warn,
-                        message: msg,
-                    });
+                    // The transport itself rarely emits this anymore —
+                    // I/O errors that mean "device is gone" are folded
+                    // into DeviceLost. Anything that does land here is
+                    // treated as a debug-level signal so it doesn't
+                    // pollute the UI with OS-locale error strings.
+                    debug!(?id, "transport error: {error}");
                 }
             }
         }
@@ -353,13 +518,18 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
 }
 
 /// Open the HID device, configure reporting, and arm the virtual
-/// output. Returns `true` on full success. Failure paths surface a
-/// log entry and stash the error in the device snapshot.
+/// output. Returns `true` if the open succeeded — but the device is
+/// only marked **`pending`** here; promotion to `connected = true`
+/// happens when the first input report actually arrives. This avoids
+/// the Windows-specific trap where `hid.open()` succeeds for paired
+/// Wiimotes that are physically off, which would otherwise cause the
+/// UI to flicker between connected and disconnected.
 fn try_connect(
     id: &str,
     devices: &mut HashMap<String, DeviceSnapshot>,
     hid: &mut HidTransport,
     outputs: &mut HashMap<String, Box<dyn Output>>,
+    pending: &mut HashSet<String>,
     events_tx: &Sender<UiEvent>,
 ) -> bool {
     let snap = match devices.get(id).cloned() {
@@ -404,14 +574,8 @@ fn try_connect(
                 }
             }
 
-            if let Some(d) = devices.get_mut(id) {
-                d.connected = true;
-                d.last_error = None;
-            }
-            let _ = events_tx.send(UiEvent::Log {
-                level: LogLevel::Info,
-                message: format!("connected: {} ({})", snap.name, short_id(id)),
-            });
+            // Tentative: confirmed by the first input report.
+            pending.insert(id.to_string());
             true
         }
         Err(e) => {
@@ -457,6 +621,9 @@ fn decompose(
         InputReport::Status {
             buttons, battery, ..
         } => (Some(*buttons), None, None, Some(*battery)),
+        InputReport::Ack { buttons, .. } | InputReport::ReadResponse { buttons, .. } => {
+            (Some(*buttons), None, None, None)
+        }
         InputReport::Buttons { buttons } => (Some(*buttons), None, None, None),
         InputReport::ButtonsAccel { buttons, accel } => {
             (Some(*buttons), Some(*accel), None, None)

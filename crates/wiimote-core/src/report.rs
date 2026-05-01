@@ -48,6 +48,25 @@ pub enum InputReport {
         battery: u8,
         flags: StatusFlags,
     },
+    /// 0x21: read response from EEPROM/registers.
+    ReadResponse {
+        buttons: Buttons,
+        /// Low nibble of byte 3: 0 on success, non-zero error code.
+        error: u8,
+        /// (high nibble of byte 3) + 1: number of valid bytes in `data`.
+        size: usize,
+        /// Low 16 bits of the original read address.
+        address: u16,
+        /// Always 16 bytes; only the first `size` are meaningful.
+        data: [u8; 16],
+    },
+    /// 0x22: ack for an output report. `report_id` is the report we
+    /// wrote (e.g. 0x16 for register write); `error == 0` means success.
+    Ack {
+        buttons: Buttons,
+        report_id: u8,
+        error: u8,
+    },
     /// 0x30: core buttons only.
     Buttons { buttons: Buttons },
     /// 0x31: buttons + 10-bit accelerometer.
@@ -83,6 +102,31 @@ pub fn parse_input(buf: &[u8]) -> Result<InputReport, ReportError> {
                     ir_enabled: f & 0x08 != 0,
                     leds: (f >> 4) & 0x0F,
                 },
+            })
+        }
+        0x21 => {
+            need(buf, 22)?;
+            let buttons = Buttons::parse(buf[1], buf[2]);
+            let size_err = buf[3];
+            let size = ((size_err >> 4) as usize) + 1;
+            let error = size_err & 0x0F;
+            let address = u16::from_be_bytes([buf[4], buf[5]]);
+            let mut data = [0u8; 16];
+            data.copy_from_slice(&buf[6..22]);
+            Ok(InputReport::ReadResponse {
+                buttons,
+                error,
+                size,
+                address,
+                data,
+            })
+        }
+        0x22 => {
+            need(buf, 5)?;
+            Ok(InputReport::Ack {
+                buttons: Buttons::parse(buf[1], buf[2]),
+                report_id: buf[3],
+                error: buf[4],
             })
         }
         0x30 => {
@@ -168,6 +212,12 @@ pub enum OutputReport {
     SetReportingMode { continuous: bool, mode: u8 },
     /// 0x15: request a status report (will arrive as 0x20).
     RequestStatus,
+    /// 0x16: write up to 16 bytes to a control register. The address is
+    /// 24-bit; we always use address space 0x04 (control registers).
+    WriteRegister { address: u32, data: Vec<u8> },
+    /// 0x17: request a register read; the response arrives as 0x21.
+    /// `count` is the number of bytes to read (max 16 per response).
+    ReadRegister { address: u32, count: u16 },
 }
 
 impl OutputReport {
@@ -178,6 +228,29 @@ impl OutputReport {
                 vec![0x12, if *continuous { 0x04 } else { 0x00 }, *mode]
             }
             Self::RequestStatus => vec![0x15, 0x00],
+            Self::WriteRegister { address, data } => {
+                let mut buf = vec![0u8; 22];
+                buf[0] = 0x16;
+                buf[1] = 0x04; // address space: control registers
+                buf[2] = ((address >> 16) & 0xFF) as u8;
+                buf[3] = ((address >> 8) & 0xFF) as u8;
+                buf[4] = (address & 0xFF) as u8;
+                let n = data.len().min(16);
+                buf[5] = n as u8;
+                buf[6..6 + n].copy_from_slice(&data[..n]);
+                buf
+            }
+            Self::ReadRegister { address, count } => {
+                vec![
+                    0x17,
+                    0x04,
+                    ((address >> 16) & 0xFF) as u8,
+                    ((address >> 8) & 0xFF) as u8,
+                    (address & 0xFF) as u8,
+                    ((count >> 8) & 0xFF) as u8,
+                    (count & 0xFF) as u8,
+                ]
+            }
         }
     }
 }
@@ -258,5 +331,74 @@ mod tests {
     fn encodes_leds() {
         let r = OutputReport::SetLeds { leds: 0b0001 };
         assert_eq!(r.encode(), vec![0x11, 0b0001_0000]);
+    }
+
+    #[test]
+    fn encodes_write_register_padded_to_22_bytes() {
+        let r = OutputReport::WriteRegister {
+            address: 0x00a4_00f0,
+            data: vec![0x55],
+        };
+        let buf = r.encode();
+        assert_eq!(buf.len(), 22);
+        assert_eq!(buf[0], 0x16);
+        assert_eq!(buf[1], 0x04);
+        assert_eq!(&buf[2..5], &[0xa4, 0x00, 0xf0]);
+        assert_eq!(buf[5], 1);
+        assert_eq!(buf[6], 0x55);
+        assert!(buf[7..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn encodes_read_register() {
+        let r = OutputReport::ReadRegister {
+            address: 0x00a4_00fa,
+            count: 6,
+        };
+        assert_eq!(r.encode(), vec![0x17, 0x04, 0xa4, 0x00, 0xfa, 0x00, 0x06]);
+    }
+
+    #[test]
+    fn parses_ack_for_write_register() {
+        // 0x22 BB BB report_id error
+        let r = parse_input(&[0x22, 0x00, 0x00, 0x16, 0x00]).unwrap();
+        match r {
+            InputReport::Ack {
+                report_id, error, ..
+            } => {
+                assert_eq!(report_id, 0x16);
+                assert_eq!(error, 0);
+            }
+            _ => panic!("expected Ack"),
+        }
+    }
+
+    #[test]
+    fn parses_read_response_with_extension_id() {
+        let mut buf = vec![0x21, 0x00, 0x00];
+        // size_err: 6 bytes (size-1 = 5 in high nibble) + error 0
+        buf.push(5 << 4);
+        // address (low 16 bits) = 0x00fa
+        buf.push(0x00);
+        buf.push(0xfa);
+        // 6 bytes of data (Guitar ID) + 10 bytes padding
+        buf.extend_from_slice(&[0x00, 0x00, 0xa4, 0x20, 0x01, 0x03]);
+        buf.extend_from_slice(&[0; 10]);
+        let r = parse_input(&buf).unwrap();
+        match r {
+            InputReport::ReadResponse {
+                error,
+                size,
+                address,
+                data,
+                ..
+            } => {
+                assert_eq!(error, 0);
+                assert_eq!(size, 6);
+                assert_eq!(address, 0x00fa);
+                assert_eq!(&data[..6], &[0x00, 0x00, 0xa4, 0x20, 0x01, 0x03]);
+            }
+            _ => panic!("expected ReadResponse"),
+        }
     }
 }

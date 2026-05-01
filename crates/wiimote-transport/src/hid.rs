@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::thread;
 use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::debug;
 use wiimote_core::{is_wiimote, parse_input};
 
 /// Per-device handle: outbound write channel + the join handle of the
@@ -126,13 +126,23 @@ fn io_loop(
         // changes LEDs / reporting mode.
         loop {
             match writes.try_recv() {
-                Ok(payload) => {
+                Ok(mut payload) => {
+                    // Windows' HID stack rejects writes shorter than
+                    // the device's max output-report size; for the
+                    // Wiimote that's 22 bytes (1 ID + 21 data). Without
+                    // this, SetLeds/SetReportingMode writes fail
+                    // silently and the Wiimote stays in pairing-blink
+                    // mode forever.
+                    #[cfg(target_os = "windows")]
+                    if payload.len() < 22 {
+                        payload.resize(22, 0);
+                    }
                     if let Err(e) = device.write(&payload) {
-                        warn!(?id, "hid write failed: {e}");
-                        let _ = events.send(TransportEvent::Error {
-                            id: Some(id.clone()),
-                            error: TransportError::Hid(e),
-                        });
+                        // A failing write almost always means the BT
+                        // link is gone. We don't surface it as a
+                        // separate UI event — the read loop will see
+                        // the same and fall through to DeviceLost.
+                        debug!(?id, "hid write error (likely disconnect): {e}");
                     }
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
@@ -172,10 +182,11 @@ fn io_loop(
                 }
             }
             Err(e) => {
-                let _ = events.send(TransportEvent::Error {
-                    id: Some(id.clone()),
-                    error: TransportError::Hid(e),
-                });
+                // Read errors are virtually always "device disconnected"
+                // (HID handle invalidated by BT-link drop). Don't show
+                // the verbose OS-locale error in the UI; the upcoming
+                // DeviceLost event already speaks for itself.
+                debug!(?id, "hid read error (likely disconnect): {e}");
                 break;
             }
         }

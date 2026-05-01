@@ -52,9 +52,9 @@ pub mod windows {
         pub fn new() -> anyhow::Result<Self> {
             let client = Client::connect().map_err(|e| {
                 anyhow::anyhow!(
-                    "ViGEmBus non disponibile ({e}). \
-                     Installa il driver da \
-                     https://github.com/nefarius/ViGEmBus/releases e riavvia."
+                    "ViGEmBus unavailable ({e}). \
+                     Install the driver from \
+                     https://github.com/nefarius/ViGEmBus/releases and restart."
                 )
             })?;
             let mut target = Xbox360Wired::new(client, TargetId::XBOX360_WIRED);

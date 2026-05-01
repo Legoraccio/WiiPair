@@ -5,9 +5,11 @@
 //! to one, but does not touch Bluetooth or HID directly.
 
 pub mod buttons;
+pub mod extension;
 pub mod report;
 
 pub use buttons::Buttons;
+pub use extension::ExtensionType;
 pub use report::{
     Accelerometer, InputReport, IrDot, IrDots, OutputReport, ReportError, StatusFlags, parse_input,
 };
