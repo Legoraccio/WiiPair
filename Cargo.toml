@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wiimote-core",
+    "crates/wiimote-transport",
+    "crates/wiimote-output",
+    "crates/wiimote-daemon",
+    "apps/wiipair-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+rust-version = "1.80"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+bitflags = "2"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
