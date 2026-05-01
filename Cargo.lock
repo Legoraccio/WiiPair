@@ -2939,6 +2939,7 @@ dependencies = [
 name = "wiipair-ui"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "eframe",
  "egui",
  "tracing-subscriber",

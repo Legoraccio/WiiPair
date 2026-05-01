@@ -80,6 +80,12 @@ pub enum InputReport {
         accel: Accelerometer,
         ir: IrDots,
     },
+    /// 0x35: buttons + accel + 16-byte extension payload.
+    ButtonsAccelExt {
+        buttons: Buttons,
+        accel: Accelerometer,
+        ext: [u8; 16],
+    },
 }
 
 pub fn parse_input(buf: &[u8]) -> Result<InputReport, ReportError> {
@@ -150,6 +156,18 @@ pub fn parse_input(buf: &[u8]) -> Result<InputReport, ReportError> {
                 buttons,
                 accel,
                 ir,
+            })
+        }
+        0x35 => {
+            need(buf, 22)?;
+            let buttons = Buttons::parse(buf[1], buf[2]);
+            let accel = parse_accel(buf[1], buf[2], buf[3], buf[4], buf[5]);
+            let mut ext = [0u8; 16];
+            ext.copy_from_slice(&buf[6..22]);
+            Ok(InputReport::ButtonsAccelExt {
+                buttons,
+                accel,
+                ext,
             })
         }
         other => Err(ReportError::UnknownId(other)),

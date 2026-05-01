@@ -17,8 +17,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use wiimote_core::{
-    Accelerometer, Buttons, ExtensionType, InputReport, IrDots, OutputReport, PID_WIIMOTE,
-    VID_NINTENDO,
+    Accelerometer, Buttons, ExtensionData, ExtensionType, InputReport, IrDots, OutputReport,
+    PID_WIIMOTE, VID_NINTENDO,
 };
 use wiimote_output::{ControllerState, Output, default_output};
 use wiimote_transport::hid::HidTransport;
@@ -48,6 +48,10 @@ pub struct DeviceSnapshot {
     /// `None` until the post-status init dance completes, or after the
     /// extension is unplugged.
     pub extension: Option<ExtensionType>,
+    /// Live decoded state of the extension (currently held buttons,
+    /// stick positions, …). Filled in once the Wiimote is in reporting
+    /// mode 0x35; cleared on unplug or disconnect.
+    pub ext_data: Option<ExtensionData>,
     pub last_error: Option<String>,
 }
 
@@ -160,14 +164,7 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
                         d.user_disabled = false;
                     }
                     next_retry.remove(&id);
-                    if try_connect(
-                        &id,
-                        &mut devices,
-                        &mut hid,
-                        &mut outputs,
-                        &mut pending,
-                        &events_tx,
-                    ) {
+                    if try_connect(&id, &mut devices, &mut hid, &mut pending) {
                         dirty = true;
                     } else {
                         next_retry.insert(id.clone(), Instant::now() + RETRY_INTERVAL);
@@ -182,6 +179,7 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
                         d.connected = false;
                         d.user_disabled = true;
                         d.extension = None;
+                        d.ext_data = None;
                     }
                     next_retry.remove(&id);
                     dirty = true;
@@ -266,6 +264,7 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
                                     last_ir: IrDots::default(),
                                     battery: None,
                                     extension: None,
+                                    ext_data: None,
                                     last_error: None,
                                 },
                             );
@@ -294,14 +293,7 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in candidates {
-                if try_connect(
-                    &id,
-                    &mut devices,
-                    &mut hid,
-                    &mut outputs,
-                    &mut pending,
-                    &events_tx,
-                ) {
+                if try_connect(&id, &mut devices, &mut hid, &mut pending) {
                     next_retry.remove(&id);
                     dirty = true;
                 } else {
@@ -315,20 +307,15 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
             match ev {
                 TransportEvent::Report { id, report } => {
                     // First report after a tentative open confirms the
-                    // device is really online — promote it to connected.
+                    // device is really online — promote it to connected
+                    // and now (and only now) plug the virtual pad.
                     if pending.remove(&id.0) {
-                        if let Some(d) = devices.get_mut(&id.0) {
-                            d.connected = true;
-                            d.last_error = None;
-                            let _ = events_tx.send(UiEvent::Log {
-                                level: LogLevel::Info,
-                                message: format!(
-                                    "connected: {} ({})",
-                                    d.name,
-                                    short_id(&id.0)
-                                ),
-                            });
-                        }
+                        promote_to_connected(
+                            &id.0,
+                            &mut devices,
+                            &mut outputs,
+                            &events_tx,
+                        );
                         dirty = true;
                     }
 
@@ -357,12 +344,33 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
                                     );
                                 }
                             } else {
+                                let was_present = matches!(
+                                    ext_phase.get(&id.0),
+                                    Some(ExtensionPhase::Identified(_))
+                                );
                                 ext_phase.remove(&id.0);
                                 if let Some(d) = devices.get_mut(&id.0) {
-                                    if d.extension.is_some() {
+                                    if d.extension.is_some() || d.ext_data.is_some() {
                                         d.extension = None;
+                                        d.ext_data = None;
                                         dirty = true;
                                     }
+                                }
+                                if let Some(s) = states.get_mut(&id.0) {
+                                    s.ext = None;
+                                }
+                                // Drop back to the no-extension reporting
+                                // mode so we stop receiving 16 bytes of
+                                // junk extension payload per frame.
+                                if was_present {
+                                    let _ = hid.send(
+                                        &id,
+                                        &OutputReport::SetReportingMode {
+                                            continuous: true,
+                                            mode: 0x31,
+                                        }
+                                        .encode(),
+                                    );
                                 }
                             }
                         }
@@ -420,6 +428,30 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
                                         ext.label()
                                     ),
                                 });
+                                // Switch to mode 0x35 so the Wiimote
+                                // also streams the 16-byte extension
+                                // payload alongside buttons + accel.
+                                let _ = hid.send(
+                                    &id,
+                                    &OutputReport::SetReportingMode {
+                                        continuous: true,
+                                        mode: 0x35,
+                                    }
+                                    .encode(),
+                                );
+                            }
+                        }
+                        InputReport::ButtonsAccelExt { ext, .. } => {
+                            if let Some(ExtensionPhase::Identified(et)) =
+                                ext_phase.get(&id.0).copied()
+                            {
+                                let parsed = ExtensionData::parse(et, ext);
+                                if let Some(d) = devices.get_mut(&id.0) {
+                                    d.ext_data = Some(parsed);
+                                    dirty = true;
+                                }
+                                states.entry(id.0.clone()).or_default().ext =
+                                    Some(parsed);
                             }
                         }
                         _ => {}
@@ -455,7 +487,7 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
                     if let Some(out) = outputs.get_mut(&id.0) {
                         if let Some(s) = states.get(&id.0) {
                             if let Err(e) = out.update(s) {
-                                warn!("output update failed: {e}");
+                                debug!("output update failed: {e}");
                             }
                         }
                     }
@@ -472,6 +504,7 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
                         }
                         d.connected = false;
                         d.extension = None;
+                        d.ext_data = None;
                     }
                     pending.remove(&id.0);
                     outputs.remove(&id.0);
@@ -517,20 +550,21 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
     }
 }
 
-/// Open the HID device, configure reporting, and arm the virtual
-/// output. Returns `true` if the open succeeded — but the device is
-/// only marked **`pending`** here; promotion to `connected = true`
-/// happens when the first input report actually arrives. This avoids
-/// the Windows-specific trap where `hid.open()` succeeds for paired
-/// Wiimotes that are physically off, which would otherwise cause the
-/// UI to flicker between connected and disconnected.
+/// Open the HID device and set initial reporting. Returns `true` if
+/// the open succeeded — the device is only marked **`pending`** here;
+/// promotion to `connected = true` happens when the first input report
+/// actually arrives, and *that* is when we plug a virtual controller.
+///
+/// Plugging ViGEm here would be wrong: on Windows `hid.open()` succeeds
+/// even for paired-but-offline Wiimotes, so we'd repeatedly plug-and-
+/// unplug a virtual Xbox 360 pad every retry cycle, which both confuses
+/// games (XInput drops the controller) and can leave the ViGEmBus
+/// driver in a stuck state.
 fn try_connect(
     id: &str,
     devices: &mut HashMap<String, DeviceSnapshot>,
     hid: &mut HidTransport,
-    outputs: &mut HashMap<String, Box<dyn Output>>,
     pending: &mut HashSet<String>,
-    events_tx: &Sender<UiEvent>,
 ) -> bool {
     let snap = match devices.get(id).cloned() {
         Some(s) => s,
@@ -556,37 +590,61 @@ fn try_connect(
                 .encode(),
             );
             let _ = hid.send(&info.id, &OutputReport::RequestStatus.encode());
-
-            match default_output() {
-                Ok(out) => {
-                    outputs.insert(id.to_string(), out);
-                }
-                Err(e) => {
-                    let msg = format!("output disabled: {e}");
-                    warn!("{msg}");
-                    if let Some(d) = devices.get_mut(id) {
-                        d.last_error = Some(msg.clone());
-                    }
-                    let _ = events_tx.send(UiEvent::Log {
-                        level: LogLevel::Warn,
-                        message: msg,
-                    });
-                }
-            }
-
-            // Tentative: confirmed by the first input report.
+            // Tentative: confirmed when the first input report arrives.
             pending.insert(id.to_string());
             true
         }
         Err(e) => {
-            let msg = format!("open failed: {e}");
             // Demote to debug-level log: with auto-retry on, this can
             // fire every few seconds when the Wiimote is just off.
-            tracing::debug!("{msg}");
+            tracing::debug!("open failed: {e}");
             if let Some(d) = devices.get_mut(id) {
-                d.last_error = Some(msg);
+                d.last_error = Some(format!("open failed: {e}"));
             }
             false
+        }
+    }
+}
+
+/// Called when the first real input report confirms a paired-and-online
+/// device — flips it to `connected`, plugs the ViGEm virtual pad, and
+/// surfaces logs. Idempotent in practice: the only call site is the
+/// pending → connected transition in the report loop, which fires once.
+fn promote_to_connected(
+    id: &str,
+    devices: &mut HashMap<String, DeviceSnapshot>,
+    outputs: &mut HashMap<String, Box<dyn Output>>,
+    events_tx: &Sender<UiEvent>,
+) {
+    if let Some(d) = devices.get_mut(id) {
+        d.connected = true;
+        d.last_error = None;
+        let _ = events_tx.send(UiEvent::Log {
+            level: LogLevel::Info,
+            message: format!("connected: {} ({})", d.name, short_id(id)),
+        });
+    }
+    match default_output() {
+        Ok(out) => {
+            outputs.insert(id.to_string(), out);
+            let _ = events_tx.send(UiEvent::Log {
+                level: LogLevel::Info,
+                message: format!("virtual Xbox 360 pad ready for {}", short_id(id)),
+            });
+        }
+        Err(e) => {
+            // Technical detail (Win32 codes etc.) only goes to the
+            // debug log; the UI sees a clean, actionable message.
+            debug!("output init failed: {e}");
+            let user_msg =
+                "Virtual controller output unavailable — install or restart ViGEmBus";
+            if let Some(d) = devices.get_mut(id) {
+                d.last_error = Some(user_msg.into());
+            }
+            let _ = events_tx.send(UiEvent::Log {
+                level: LogLevel::Warn,
+                message: user_msg.into(),
+            });
         }
     }
 }
@@ -633,5 +691,8 @@ fn decompose(
             accel,
             ir,
         } => (Some(*buttons), Some(*accel), Some(*ir), None),
+        InputReport::ButtonsAccelExt { buttons, accel, .. } => {
+            (Some(*buttons), Some(*accel), None, None)
+        }
     }
 }

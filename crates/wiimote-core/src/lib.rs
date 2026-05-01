@@ -9,7 +9,10 @@ pub mod extension;
 pub mod report;
 
 pub use buttons::Buttons;
-pub use extension::ExtensionType;
+pub use extension::{
+    ClassicButtons, ClassicState, DrumsButtons, DrumsState, ExtensionData, ExtensionType,
+    GuitarButtons, GuitarState, NunchukState,
+};
 pub use report::{
     Accelerometer, InputReport, IrDot, IrDots, OutputReport, ReportError, StatusFlags, parse_input,
 };
