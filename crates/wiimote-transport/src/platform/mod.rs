@@ -43,6 +43,13 @@ impl PlatformScanner {
         Ok(Self { _events: events })
     }
 
+    /// Returns a flag the daemon can flip to suspend active Bluetooth
+    /// inquiry while a device is connected. No-op on platforms without
+    /// a real scanner.
+    pub fn pause_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
+    }
+
     /// No-op until Linux (BlueZ) and macOS (IOBluetooth) backends land.
     pub fn start(&mut self) -> anyhow::Result<()> {
         Ok(())

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::thread;
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, warn};
 use wiimote_core::{is_wiimote, parse_input};
 
 /// Per-device handle: outbound write channel + the join handle of the
@@ -118,9 +118,19 @@ fn io_loop(
     /// often won't error the HID handle when the BT link drops.
     const READ_TIMEOUT_MS: i32 = 50;
     const IDLE_DEADLINE: u32 = 40;
+    /// Surface gaps between reports — healthy is ~10 ms; anything over
+    /// this is interesting (Bluetooth sniff windows, inquiry stalls,
+    /// host scheduler hiccups).
+    const GAP_WARN_MS: u128 = 80;
+    /// Don't emit gap events to the UI more often than this — gaps
+    /// often come in bursts, and a wall of identical log lines isn't
+    /// useful.
+    const GAP_EMIT_BACKOFF: Duration = Duration::from_millis(800);
 
     let mut buf = [0u8; 64];
     let mut idle_timeouts: u32 = 0;
+    let mut last_report_at: Option<std::time::Instant> = None;
+    let mut last_gap_emit: Option<std::time::Instant> = None;
     loop {
         // Drain any pending writes first — keeps latency low if the UI
         // changes LEDs / reporting mode.
@@ -168,6 +178,24 @@ fn io_loop(
             }
             Ok(n) => {
                 idle_timeouts = 0;
+                let now = std::time::Instant::now();
+                if let Some(prev) = last_report_at {
+                    let gap_ms = now.duration_since(prev).as_millis();
+                    if gap_ms > GAP_WARN_MS {
+                        let due_emit = last_gap_emit
+                            .map(|t| now.duration_since(t) >= GAP_EMIT_BACKOFF)
+                            .unwrap_or(true);
+                        if due_emit {
+                            last_gap_emit = Some(now);
+                            warn!(?id, "report gap: {} ms", gap_ms);
+                            // The UI-facing gap log is emitted by the
+                            // daemon directly off of inter-arrival
+                            // timestamps; this `warn!` is just the
+                            // terminal/stderr breadcrumb.
+                        }
+                    }
+                }
+                last_report_at = Some(now);
                 match parse_input(&buf[..n]) {
                     Ok(report) => {
                         let _ = events.send(TransportEvent::Report {

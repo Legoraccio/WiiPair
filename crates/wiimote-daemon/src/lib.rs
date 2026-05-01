@@ -31,6 +31,16 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// Right after a `DeviceLost` event we retry sooner — the Wiimote
 /// might be cycled off-and-on quickly.
 const QUICK_RETRY_AFTER_LOSS: Duration = Duration::from_millis(800);
+/// How often we send a no-op `RequestStatus` to each connected Wiimote
+/// to keep the BT-HID link active. Aggressive (200 ms = 5/s) because
+/// Windows negotiates BT sniff intervals around 1.28 s by default — a
+/// slower keepalive gets queued through sniff windows and lets the
+/// link starve between them, showing up as 1.2-1.5 s input freezes.
+/// Even at 200 ms it's only ~150 B/s of BT traffic.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(200);
+/// How long a user-initiated scan stays open. While active, the BT
+/// scanner runs inquiries even with controllers already connected.
+const MANUAL_SCAN_DURATION: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct DeviceSnapshot {
@@ -70,6 +80,11 @@ enum ExtensionPhase {
 pub enum UiEvent {
     DeviceListChanged(Vec<DeviceSnapshot>),
     Log { level: LogLevel, message: String },
+    /// User-initiated discovery window state. `Some(deadline)` means a
+    /// scan is currently active until that instant; `None` means no
+    /// scan window is active. Lets the UI count down and disable the
+    /// button while scanning.
+    ScanState { active_until: Option<Instant> },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -83,6 +98,10 @@ pub enum LogLevel {
 pub enum UiCommand {
     Connect(String),
     Disconnect(String),
+    /// Open a 10 s window in which the BT scanner runs inquiries even
+    /// while controllers are already connected — used to add a second
+    /// (third, fourth) Wiimote without disconnecting the first.
+    StartScan,
     Quit,
 }
 
@@ -122,6 +141,7 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
 
     let (scanner_tx, scanner_rx) = unbounded();
     let mut scanner = PlatformScanner::new(scanner_tx)?;
+    let scan_pause = scanner.pause_handle();
     if let Err(e) = scanner.start() {
         warn!("bluetooth scanner not available: {e}");
         let _ = events_tx.send(UiEvent::Log {
@@ -141,10 +161,32 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
     let mut next_retry: HashMap<String, Instant> = HashMap::new();
     // Extension identification finite-state machine, per device.
     let mut ext_phase: HashMap<String, ExtensionPhase> = HashMap::new();
+    // Lowest raw whammy value seen so far on each device — used to
+    // self-calibrate the released position to "0%". Different guitars
+    // (and even different units of the same model) have different rest
+    // values; some sit at raw 0, others at ~16.
+    let mut whammy_baseline: HashMap<String, u8> = HashMap::new();
+    // Last time we sent a keepalive (RequestStatus) to each connected
+    // device — drives the periodic ping that keeps Bluetooth out of
+    // long sniff intervals.
+    let mut last_keepalive: HashMap<String, Instant> = HashMap::new();
+    // Inter-arrival timestamps used to surface BT/HID input stalls.
+    let mut last_report_time: HashMap<String, Instant> = HashMap::new();
+    // Throttle of the gap log per device — bursts of contiguous gaps
+    // happen during sniff windows; one log line per second is enough.
+    let mut last_gap_log: HashMap<String, Instant> = HashMap::new();
+    // 0..=3 player slot assigned to each connected Wiimote. Drives the
+    // LED pattern (so multiple Wiimotes show different player numbers)
+    // and pairs naturally with ViGEm's XInput-slot ordering.
+    let mut slot_assignment: HashMap<String, u8> = HashMap::new();
+    // When `Some(t)`, BT inquiry is forced on until `t` regardless of
+    // whether a Wiimote is connected. Set by `UiCommand::StartScan`.
+    let mut manual_scan_until: Option<Instant> = None;
 
-    let scan_interval = Duration::from_secs(2);
+    /// Tick rate of the periodic scan + retry-connect block.
+    const SCAN_INTERVAL: Duration = Duration::from_secs(2);
     let mut last_scan = Instant::now()
-        .checked_sub(scan_interval)
+        .checked_sub(SCAN_INTERVAL)
         .unwrap_or_else(Instant::now);
     let mut dirty = true;
     let mut force_rescan = false;
@@ -170,11 +212,31 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
                         next_retry.insert(id.clone(), Instant::now() + RETRY_INTERVAL);
                     }
                 }
+                UiCommand::StartScan => {
+                    let until = Instant::now() + MANUAL_SCAN_DURATION;
+                    manual_scan_until = Some(until);
+                    force_rescan = true;
+                    let _ = events_tx.send(UiEvent::ScanState {
+                        active_until: Some(until),
+                    });
+                    let _ = events_tx.send(UiEvent::Log {
+                        level: LogLevel::Info,
+                        message: format!(
+                            "scanning for new devices for {} s…",
+                            MANUAL_SCAN_DURATION.as_secs()
+                        ),
+                    });
+                }
                 UiCommand::Disconnect(id) => {
                     let _ = hid.close(&DeviceId(id.clone()));
                     outputs.remove(&id);
                     pending.remove(&id);
                     ext_phase.remove(&id);
+                    whammy_baseline.remove(&id);
+                    last_keepalive.remove(&id);
+                    last_report_time.remove(&id);
+                    last_gap_log.remove(&id);
+                    slot_assignment.remove(&id);
                     if let Some(d) = devices.get_mut(&id) {
                         d.connected = false;
                         d.user_disabled = true;
@@ -245,37 +307,52 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
         }
 
         // 2b) Periodic HID scan + auto-(re)connect ------------------------
-        if force_rescan || last_scan.elapsed() >= scan_interval {
+        if force_rescan || last_scan.elapsed() >= SCAN_INTERVAL {
+            let was_forced = force_rescan;
             force_rescan = false;
             last_scan = Instant::now();
-            match hid.enumerate() {
-                Ok(found) => {
-                    for f in &found {
-                        if !devices.contains_key(&f.id.0) {
-                            devices.insert(
-                                f.id.0.clone(),
-                                DeviceSnapshot {
-                                    id: f.id.0.clone(),
-                                    name: f.name.clone(),
-                                    connected: false,
-                                    user_disabled: false,
-                                    last_buttons: Buttons::default(),
-                                    last_accel: Accelerometer::default(),
-                                    last_ir: IrDots::default(),
-                                    battery: None,
-                                    extension: None,
-                                    ext_data: None,
-                                    last_error: None,
-                                },
-                            );
-                            // Auto-connect on first sight: drop a stale
-                            // retry guard, then attempt below.
-                            next_retry.remove(&f.id.0);
-                            dirty = true;
+            // `hid.enumerate()` walks the SetupAPI HID class list under
+            // the hood — on Windows it costs ~150-300 ms and stalls the
+            // open HID handle's I/O for that duration. We only call it
+            // when there's nothing actively connected to disturb, when
+            // forced by the BT scanner enabling HID on a new device,
+            // or when the user is actively asking us to look for new
+            // devices via the Scan button (then they accept the brief
+            // hiccup). The retry-connect loop below uses `hid.open()`
+            // which doesn't trigger SetupAPI and is cheap.
+            let any_connected_now = devices.values().any(|d| d.connected);
+            let allow_enum =
+                was_forced || !any_connected_now || manual_scan_until.is_some();
+            if allow_enum {
+                match hid.enumerate() {
+                    Ok(found) => {
+                        for f in &found {
+                            if !devices.contains_key(&f.id.0) {
+                                devices.insert(
+                                    f.id.0.clone(),
+                                    DeviceSnapshot {
+                                        id: f.id.0.clone(),
+                                        name: f.name.clone(),
+                                        connected: false,
+                                        user_disabled: false,
+                                        last_buttons: Buttons::default(),
+                                        last_accel: Accelerometer::default(),
+                                        last_ir: IrDots::default(),
+                                        battery: None,
+                                        extension: None,
+                                        ext_data: None,
+                                        last_error: None,
+                                    },
+                                );
+                                // Auto-connect on first sight: drop a
+                                // stale retry guard, then attempt below.
+                                next_retry.remove(&f.id.0);
+                                dirty = true;
+                            }
                         }
                     }
+                    Err(e) => warn!("scan failed: {e}"),
                 }
-                Err(e) => warn!("scan failed: {e}"),
             }
 
             // Try (re)connecting any device that is known, idle, allowed
@@ -314,10 +391,39 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
                             &id.0,
                             &mut devices,
                             &mut outputs,
+                            &mut hid,
+                            &mut slot_assignment,
                             &events_tx,
                         );
                         dirty = true;
                     }
+
+                    // Inter-arrival gap detection — surfaces BT stalls
+                    // (sniff windows, inquiry interleave, scheduler
+                    // hiccups) directly into the on-screen log.
+                    let now_t = Instant::now();
+                    if let Some(prev) = last_report_time.get(&id.0).copied() {
+                        let gap_ms = now_t.duration_since(prev).as_millis();
+                        if gap_ms > 80 {
+                            let due = last_gap_log
+                                .get(&id.0)
+                                .is_none_or(|t| {
+                                    now_t.duration_since(*t)
+                                        >= Duration::from_millis(800)
+                                });
+                            if due {
+                                last_gap_log.insert(id.0.clone(), now_t);
+                                let _ = events_tx.send(UiEvent::Log {
+                                    level: LogLevel::Warn,
+                                    message: format!(
+                                        "report gap: {} ms",
+                                        gap_ms
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    last_report_time.insert(id.0.clone(), now_t);
 
                     // Extension identification FSM ---------------------
                     match &report {
@@ -416,6 +522,10 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
                                     id.0.clone(),
                                     ExtensionPhase::Identified(ext),
                                 );
+                                // Reset per-extension calibration so a
+                                // freshly-plugged guitar starts learning
+                                // its own whammy baseline from scratch.
+                                whammy_baseline.remove(&id.0);
                                 if let Some(d) = devices.get_mut(&id.0) {
                                     d.extension = Some(ext);
                                     dirty = true;
@@ -445,7 +555,24 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
                             if let Some(ExtensionPhase::Identified(et)) =
                                 ext_phase.get(&id.0).copied()
                             {
-                                let parsed = ExtensionData::parse(et, ext);
+                                let mut parsed = ExtensionData::parse(et, ext);
+                                // Auto-calibrate whammy: pull the lowest
+                                // observed value down to "0%". Stabilises
+                                // after a few frames regardless of the
+                                // particular guitar's rest position.
+                                if let ExtensionData::Guitar(g) = &mut parsed {
+                                    let baseline = whammy_baseline
+                                        .entry(id.0.clone())
+                                        .or_insert(g.whammy);
+                                    if g.whammy < *baseline {
+                                        *baseline = g.whammy;
+                                    }
+                                    let span = 31u32
+                                        .saturating_sub(*baseline as u32)
+                                        .max(1);
+                                    let above = g.whammy.saturating_sub(*baseline);
+                                    g.whammy = ((above as u32 * 31) / span) as u8;
+                                }
                                 if let Some(d) = devices.get_mut(&id.0) {
                                     d.ext_data = Some(parsed);
                                     dirty = true;
@@ -510,6 +637,11 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
                     outputs.remove(&id.0);
                     states.remove(&id.0);
                     ext_phase.remove(&id.0);
+                    whammy_baseline.remove(&id.0);
+                    last_keepalive.remove(&id.0);
+                    last_report_time.remove(&id.0);
+                    last_gap_log.remove(&id.0);
+                    slot_assignment.remove(&id.0);
                     // The io_loop has exited; clean up its handle entry
                     // in the transport so the next `try_connect` spawns
                     // a fresh thread instead of short-circuiting on the
@@ -530,15 +662,57 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
                 }
                 TransportEvent::DeviceFound(_) => {}
                 TransportEvent::Error { id, error } => {
-                    // The transport itself rarely emits this anymore —
-                    // I/O errors that mean "device is gone" are folded
-                    // into DeviceLost. Anything that does land here is
-                    // treated as a debug-level signal so it doesn't
-                    // pollute the UI with OS-locale error strings.
                     debug!(?id, "transport error: {error}");
                 }
             }
         }
+
+        // Periodic keepalive — ping each connected Wiimote with a
+        // RequestStatus once per KEEPALIVE_INTERVAL. The Status reply
+        // goes through the same FSM as any other status report (no
+        // side-effects when the extension is already identified), and
+        // the round-trip alone is enough traffic to keep the BT stack
+        // out of multi-hundred-ms sniff windows.
+        let now = Instant::now();
+        let due_keepalives: Vec<String> = devices
+            .iter()
+            .filter(|(id, snap)| {
+                snap.connected
+                    && last_keepalive
+                        .get(id.as_str())
+                        .is_none_or(|t| now.duration_since(*t) >= KEEPALIVE_INTERVAL)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due_keepalives {
+            let _ = hid.send(
+                &DeviceId(id.clone()),
+                &OutputReport::RequestStatus.encode(),
+            );
+            last_keepalive.insert(id, now);
+        }
+
+        // Expire the manual scan window when its deadline passes —
+        // emit a closing event and a log so the UI can re-enable the
+        // Scan button and the user gets visible feedback.
+        if let Some(t) = manual_scan_until {
+            if Instant::now() >= t {
+                manual_scan_until = None;
+                force_rescan = true; // pick up any device that just got HID-enabled
+                let _ = events_tx.send(UiEvent::ScanState { active_until: None });
+                let _ = events_tx.send(UiEvent::Log {
+                    level: LogLevel::Info,
+                    message: "scan window ended".into(),
+                });
+            }
+        }
+
+        // Pause active BT inquiry while controllers are connected and
+        // the user isn't explicitly asking to find new ones.
+        let any_connected = devices.values().any(|d| d.connected);
+        let manual_scan_active = manual_scan_until.is_some();
+        let pause_inquiry = any_connected && !manual_scan_active;
+        scan_pause.store(pause_inquiry, std::sync::atomic::Ordering::Relaxed);
 
         if dirty {
             let list: Vec<_> = devices.values().cloned().collect();
@@ -614,14 +788,33 @@ fn promote_to_connected(
     id: &str,
     devices: &mut HashMap<String, DeviceSnapshot>,
     outputs: &mut HashMap<String, Box<dyn Output>>,
+    hid: &mut HidTransport,
+    slot_assignment: &mut HashMap<String, u8>,
     events_tx: &Sender<UiEvent>,
 ) {
+    // Pick the lowest free player slot (0-3). With 4+ Wiimotes we wrap
+    // to 0 — XInput supports at most 4 controllers anyway.
+    let slot = (0u8..4)
+        .find(|s| !slot_assignment.values().any(|v| v == s))
+        .unwrap_or(0);
+    slot_assignment.insert(id.to_string(), slot);
+    // Light up the player LED to match the slot (slot 0 → LED 1, …).
+    let _ = hid.send(
+        &DeviceId(id.to_string()),
+        &OutputReport::SetLeds { leds: 1 << slot }.encode(),
+    );
+
     if let Some(d) = devices.get_mut(id) {
         d.connected = true;
         d.last_error = None;
         let _ = events_tx.send(UiEvent::Log {
             level: LogLevel::Info,
-            message: format!("connected: {} ({})", d.name, short_id(id)),
+            message: format!(
+                "connected: {} as Player {} ({})",
+                d.name,
+                slot + 1,
+                short_id(id)
+            ),
         });
     }
     match default_output() {

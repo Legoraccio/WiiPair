@@ -1,3 +1,4 @@
+use chrono::{DateTime, Local};
 use crossbeam_channel::Sender;
 use eframe::egui;
 use std::collections::VecDeque;
@@ -30,6 +31,10 @@ fn main() -> eframe::Result {
 }
 
 struct LogLine {
+    /// Wall-clock when the daemon emitted (or the UI ingested) the
+    /// event. Surfaced as a `HH:MM:SS.mmm` prefix in the log pane so
+    /// the user can correlate freezes with what the system was doing.
+    timestamp: DateTime<Local>,
     level: LogLevel,
     text: String,
 }
@@ -38,6 +43,9 @@ struct App {
     daemon: Daemon,
     devices: Vec<DeviceSnapshot>,
     log: VecDeque<LogLine>,
+    /// `Some(deadline)` while the daemon's manual scan window is open.
+    /// Drives the Scan button's disabled state and the countdown text.
+    scan_active_until: Option<std::time::Instant>,
 }
 
 impl App {
@@ -46,6 +54,7 @@ impl App {
             daemon,
             devices: Vec::new(),
             log: VecDeque::with_capacity(64),
+            scan_active_until: None,
         }
     }
 
@@ -58,9 +67,13 @@ impl App {
                         self.log.pop_front();
                     }
                     self.log.push_back(LogLine {
+                        timestamp: Local::now(),
                         level,
                         text: message,
                     });
+                }
+                UiEvent::ScanState { active_until } => {
+                    self.scan_active_until = active_until;
                 }
             }
         }
@@ -74,8 +87,46 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("WiiPair");
-                ui.label(egui::RichText::new("·").weak());
-                ui.label("scanning every 2 s");
+
+                // Scan button — opens a 10 s discovery window. Disabled
+                // and counting down while a window is already open, so
+                // the user gets visible feedback that the scan is live.
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let now = std::time::Instant::now();
+                        let remaining = self
+                            .scan_active_until
+                            .and_then(|t| t.checked_duration_since(now));
+                        match remaining {
+                            Some(left) => {
+                                let _ = ui.add_enabled(
+                                    false,
+                                    egui::Button::new(format!(
+                                        "Scanning… {:>2}s",
+                                        left.as_secs() + 1
+                                    )),
+                                );
+                            }
+                            None => {
+                                if ui
+                                    .button("Scan for new devices (10 s)")
+                                    .on_hover_text(
+                                        "Open a 10 s window to discover and pair new \
+                                         Wiimotes. Hold 1+2 on the controller while the \
+                                         button is counting down.",
+                                    )
+                                    .clicked()
+                                {
+                                    let _ = self
+                                        .daemon
+                                        .commands_tx
+                                        .send(UiCommand::StartScan);
+                                }
+                            }
+                        }
+                    },
+                );
             });
         });
 
@@ -83,16 +134,30 @@ impl eframe::App for App {
             .resizable(true)
             .show(ctx, |ui| {
                 ui.label(egui::RichText::new("Log").strong());
-                egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
-                    for line in &self.log {
-                        let color = match line.level {
-                            LogLevel::Info => egui::Color32::LIGHT_GRAY,
-                            LogLevel::Warn => egui::Color32::YELLOW,
-                            LogLevel::Error => egui::Color32::LIGHT_RED,
-                        };
-                        ui.colored_label(color, &line.text);
-                    }
-                });
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .max_height(120.0)
+                    .show(ui, |ui| {
+                        for line in &self.log {
+                            let color = match line.level {
+                                LogLevel::Info => egui::Color32::LIGHT_GRAY,
+                                LogLevel::Warn => egui::Color32::YELLOW,
+                                LogLevel::Error => egui::Color32::LIGHT_RED,
+                            };
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(
+                                        line.timestamp
+                                            .format("%H:%M:%S%.3f")
+                                            .to_string(),
+                                    )
+                                    .monospace()
+                                    .weak(),
+                                );
+                                ui.colored_label(color, &line.text);
+                            });
+                        }
+                    });
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
