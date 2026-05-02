@@ -182,6 +182,25 @@ impl DeviceRegistry {
         self.map.remove(id)
     }
 
+    /// Move an existing entry from `old_id` to `new_id`, preserving every
+    /// runtime field. Used to migrate legacy snapshots that were keyed
+    /// on the HID path before hidapi started returning a stable BT MAC
+    /// for them — without this, a fresh enumerate inserts a second entry
+    /// under the MAC and the user sees the same device twice in the UI.
+    /// No-op if `old_id` doesn't exist or if `new_id` is already taken.
+    pub fn rekey(&mut self, old_id: &str, new_id: &str) -> bool {
+        if old_id == new_id || self.map.contains_key(new_id) {
+            return false;
+        }
+        if let Some(mut runtime) = self.map.remove(old_id) {
+            runtime.snapshot.id = new_id.to_string();
+            self.map.insert(new_id.to_string(), runtime);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&String, &DeviceRuntime)> {
         self.map.iter()
     }
