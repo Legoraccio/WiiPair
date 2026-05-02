@@ -161,7 +161,7 @@ fn render_profile_selector(
 ) {
     ui.label(egui::RichText::new("Profile").small().weak());
     let mut chosen = d.mapping_profile;
-    egui::ComboBox::from_id_source(("profile", &d.id))
+    egui::ComboBox::from_id_salt(("profile", &d.id))
         .selected_text(chosen.label())
         .show_ui(ui, |ui| {
             for p in MappingProfile::all() {

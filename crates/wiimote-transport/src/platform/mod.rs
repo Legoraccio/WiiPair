@@ -22,6 +22,12 @@ pub enum ScannerEvent {
     /// HID service was activated on the device — at this point hidapi
     /// enumeration should pick it up on the next refresh.
     HidEnabled { addr: u64 },
+    /// The OS thinks the device is paired but the HID service isn't
+    /// advertised — almost always Wii Remote Plus on Windows after a
+    /// power-cycle, where `BluetoothSetServiceState(HID)` fails until
+    /// the device is unpaired and re-paired. The daemon uses this as
+    /// a trigger to auto-recover during a manual scan window.
+    SdpCacheStale { addr: u64 },
     /// Non-fatal scanner-level error (e.g. inquiry failed once).
     Error(String),
 }

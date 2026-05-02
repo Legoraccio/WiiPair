@@ -223,22 +223,30 @@ picks it up.
 
 ### Wii Remote Plus (`RVL-CNT-01-TR`) — Windows
 
-The Wii Remote Plus often needs to be **removed from Windows Bluetooth
-settings before each new pairing session**. After power-cycling the
-Wiimote the OS holds onto stale service entries from the previous
+The Wii Remote Plus has a Windows-side quirk: after a power-cycle the
+OS holds onto stale Bluetooth service entries from the previous
 session, and `BluetoothSetServiceState(HID)` fails with a generic
 `ERROR_INVALID_PARAMETER` until the device is removed and re-paired.
 
-Symptom: WiiPair reports "*HID service not advertised yet — unpair and
-re-pair to refresh SDP cache*" or "*not reachable via HID*".
+**WiiPair handles this for you.** When the scanner detects the
+stale-SDP-cache signature *during an active "Scan for new devices"
+window*, it:
 
-Workaround:
+1. Logs `[BT] AA:BB:…: stale SDP cache detected — auto-recovering`.
+2. Calls `BluetoothRemoveDevice` to drop the stale pairing.
+3. Forces an immediate re-scan so the next inquiry sees the Wiimote
+   as fresh and re-pairs it from scratch using the legacy 1+2 PIN.
 
-1. Open *Settings → Bluetooth & devices*.
-2. Find "Nintendo RVL-CNT-01-TR" and click the "…" → **Remove device**
-   (or use the in-app **Forget** button, which does the same thing).
-3. Click **Scan for new devices** in WiiPair, press 1+2 on the Wiimote
-   again, and let the auto-pair flow re-register the HID service.
+You just need to keep holding 1+2 on the Wiimote (the LEDs blinking in
+sequence 1→2→3→4) for a couple of extra seconds while the recovery
+runs. No need to open Windows BT settings.
+
+Auto-recovery only fires while a manual scan window is active — outside
+of it the daemon won't depair a "good but offline" device, since
+without 1+2 held the next inquiry won't find it again. If you see the
+log line `HID service not advertised (stale SDP cache)` outside a scan
+window, click **Scan for new devices** and press 1+2 to trigger the
+recovery.
 
 The original Wii Remote (`RVL-CNT-01`) doesn't have this issue on most
 Windows builds.

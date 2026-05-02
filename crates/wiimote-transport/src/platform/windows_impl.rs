@@ -34,7 +34,9 @@ use windows::Win32::Devices::Bluetooth::{
     BluetoothSendAuthenticationResponseEx, BluetoothSetServiceState,
     BluetoothUnregisterAuthentication, MITMProtectionNotRequired,
 };
-use windows::Win32::Foundation::{BOOL, CloseHandle, ERROR_SUCCESS, FALSE, HANDLE, HWND, TRUE};
+use windows::Win32::Foundation::{
+    BOOL, CloseHandle, ERROR_INVALID_PARAMETER, ERROR_SUCCESS, FALSE, HANDLE, HWND, TRUE,
+};
 use windows::core::GUID;
 
 /// Bluetooth HID service class GUID (0x1124 in the BT base).
@@ -414,7 +416,8 @@ fn enable_hid_service(
     events: &Sender<ScannerEvent>,
 ) -> Result<(), String> {
     let mut info_local = *info;
-    let err = with_radio(|h_radio| unsafe {
+    let addr = unsafe { info.Address.Anonymous.ullLong };
+    let result = with_radio(|h_radio| unsafe {
         // Refresh the cached BT registry record for this device. The
         // info returned by inquiry can be missing post-pair service
         // entries, which can cause SetServiceState to choke with
@@ -424,30 +427,29 @@ fn enable_hid_service(
             debug!("GetDeviceInfo 0x{:08x}", refresh_rc);
         }
 
-        // List every BT service registered for this device. If the HID
-        // UUID isn't here, SetServiceState will always fail — surface
-        // a clean message to the user.
-        let mut hid_present = enumerate_services_lookup_hid(h_radio, &info_local);
-        if hid_present == ServiceLookup::Empty {
-            let _ = events.send(ScannerEvent::Error(
-                "no installed services — unpair and re-pair from Windows BT settings".into(),
-            ));
-        } else if hid_present == ServiceLookup::MissingHid {
-            let _ = events.send(ScannerEvent::Error(
-                "HID service not advertised yet — unpair and re-pair to refresh SDP cache".into(),
-            ));
-        }
-        let _ = &mut hid_present;
+        // Best-effort diagnostic: log the registered service list so
+        // debug builds can correlate SDP-cache state with the
+        // SetServiceState outcome.
+        let _ = enumerate_services_lookup_hid(h_radio, &info_local);
 
-        BluetoothSetServiceState(
+        let svc_rc = BluetoothSetServiceState(
             h_radio,
             &info_local,
             &HID_SERVICE_GUID,
             BLUETOOTH_SERVICE_ENABLE,
-        )
+        );
+        // ERROR_INVALID_PARAMETER (0x57) here is the canonical Wii
+        // Remote Plus signature: Windows holds onto stale post-pair
+        // SDP entries from the previous power cycle, and the only
+        // recovery is to unpair-then-repair. Surface it so the daemon
+        // can auto-recover during a manual scan window.
+        if svc_rc == ERROR_INVALID_PARAMETER.0 {
+            let _ = events.send(ScannerEvent::SdpCacheStale { addr });
+        }
+        svc_rc
     })?;
-    if err != ERROR_SUCCESS.0 {
-        return Err(format!("SetServiceState 0x{err:08x}"));
+    if result != ERROR_SUCCESS.0 {
+        return Err(format!("SetServiceState 0x{result:08x}"));
     }
     Ok(())
 }

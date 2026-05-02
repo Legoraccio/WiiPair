@@ -191,6 +191,10 @@ struct DaemonCtx {
     /// Addresses we've already notified about — prevents emitting
     /// `PairingStuck` repeatedly for the same hung attempt.
     pair_stuck_signaled: HashSet<u64>,
+    /// Addresses for which we've auto-unpaired during the current scan
+    /// window. Reset when the scan window closes so the user can retry
+    /// after the next "Scan for new devices" click.
+    sdp_recovery_attempted: HashSet<u64>,
     /// Set when the persisted on-disk config is stale.
     persist_dirty: bool,
     /// Set when the UI snapshot is stale.
@@ -207,6 +211,7 @@ impl DaemonCtx {
             manual_scan_until: None,
             pair_started: HashMap::new(),
             pair_stuck_signaled: HashSet::new(),
+            sdp_recovery_attempted: HashSet::new(),
             persist_dirty: false,
             // Initial snapshot flush ensures the UI sees the persisted
             // offline placeholders without waiting for a real change.
@@ -239,9 +244,11 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
 
     // Restore persisted devices as offline placeholders — the auto-
     // retry loop picks them up if they come online.
+    let mut restored = 0usize;
     for pd in persist::load() {
         let snap = persist::into_snapshot(pd);
         ctx.registry.insert(DeviceRuntime::new(snap));
+        restored += 1;
     }
 
     let mut last_scan = Instant::now()
@@ -249,6 +256,17 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
         .unwrap_or_else(Instant::now);
 
     info!("daemon started");
+    let _ = events_tx.send(log_event(
+        LogLevel::Info,
+        format!(
+            "daemon started: {} known device{} restored, auto-retry every {}s, \
+             keepalive every {}ms",
+            restored,
+            if restored == 1 { "" } else { "s" },
+            RETRY_INTERVAL.as_secs(),
+            KEEPALIVE_INTERVAL.as_millis()
+        ),
+    ));
 
     loop {
         // 1) UI commands ---------------------------------------------------
@@ -347,7 +365,7 @@ fn handle_command(
     match cmd {
         UiCommand::Quit => unreachable!("handled in main loop"),
         UiCommand::Connect(id) => handle_connect(id, ctx, hid, events_tx),
-        UiCommand::Disconnect(id) => handle_disconnect(id, ctx, hid),
+        UiCommand::Disconnect(id) => handle_disconnect(id, ctx, hid, events_tx),
         UiCommand::Forget(id) => handle_forget(id, ctx, hid, events_tx),
         UiCommand::Identify(id) => handle_identify(id, ctx, hid, events_tx),
         UiCommand::StartScan => handle_start_scan(ctx, events_tx),
@@ -412,7 +430,7 @@ fn handle_connect(
         LogLevel::Info,
         format!("connect requested: {}", short_id(&id)),
     ));
-    if !try_connect(&id, ctx, hid) {
+    if !try_connect(&id, ctx, hid, events_tx) {
         if let Some(r) = ctx.registry.get_mut(&id) {
             r.next_retry = Some(Instant::now() + RETRY_INTERVAL);
         }
@@ -429,7 +447,12 @@ fn handle_connect(
     ctx.dirty = true;
 }
 
-fn handle_disconnect(id: String, ctx: &mut DaemonCtx, hid: &mut HidTransport) {
+fn handle_disconnect(
+    id: String,
+    ctx: &mut DaemonCtx,
+    hid: &mut HidTransport,
+    events_tx: &Sender<UiEvent>,
+) {
     if let Some(r) = ctx.registry.get(&id) {
         // Turn the player LEDs off before tearing down.
         let p = r.snapshot.path.clone();
@@ -447,6 +470,13 @@ fn handle_disconnect(id: String, ctx: &mut DaemonCtx, hid: &mut HidTransport) {
         r.reset_session();
         r.snapshot.user_disabled = true;
     }
+    let _ = events_tx.send(log_event(
+        LogLevel::Info,
+        format!(
+            "disconnected: {} (auto-retry disabled until you click Connect)",
+            short_id(&id)
+        ),
+    ));
     ctx.dirty = true;
 }
 
@@ -596,8 +626,68 @@ fn handle_scanner_event(ev: ScannerEvent, ctx: &mut DaemonCtx, events_tx: &Sende
             ));
             ctx.force_rescan = true;
         }
+        ScannerEvent::SdpCacheStale { addr } => handle_sdp_cache_stale(addr, ctx, events_tx),
         ScannerEvent::Error(e) => {
             let _ = events_tx.send(log_event(LogLevel::Warn, format!("[BT] {e}")));
+        }
+    }
+}
+
+/// Auto-recover the Wii Remote Plus SDP-cache-stale issue: depair the
+/// device, force a rescan so the next inquiry sees it as fresh, and
+/// the rest of the auto-pair flow handles it from there. Gated on a
+/// manual scan window being active — outside of that the user isn't
+/// expected to be holding 1+2, and depairing a "good but offline"
+/// device would just leave them confused.
+fn handle_sdp_cache_stale(addr: u64, ctx: &mut DaemonCtx, events_tx: &Sender<UiEvent>) {
+    let pretty = format_addr(addr);
+    if ctx.manual_scan_until.is_none() {
+        let _ = events_tx.send(log_event(
+            LogLevel::Warn,
+            format!(
+                "[BT] {pretty}: HID service not advertised (stale SDP cache). \
+                 Click 'Scan for new devices' and press 1+2 to auto-recover."
+            ),
+        ));
+        return;
+    }
+    // Don't fire repeatedly for the same device within one scan window.
+    if !ctx.sdp_recovery_attempted.insert(addr) {
+        return;
+    }
+    let _ = events_tx.send(log_event(
+        LogLevel::Info,
+        format!(
+            "[BT] {pretty}: stale SDP cache detected — auto-recovering \
+             (unpairing now; keep holding 1+2 on the Wiimote)…"
+        ),
+    ));
+    match unpair_addr(addr) {
+        Ok(()) => {
+            let _ = events_tx.send(log_event(
+                LogLevel::Info,
+                format!(
+                    "[BT] {pretty}: unpaired. The next inquiry will re-pair \
+                     it from scratch — keep holding 1+2."
+                ),
+            ));
+            ctx.force_rescan = true;
+            // Drop any existing snapshot that might point at the now-
+            // dead pairing — the next inquiry inserts a fresh one.
+            if ctx.registry.remove(&pretty).is_some() {
+                ctx.persist_dirty = true;
+                ctx.dirty = true;
+            }
+        }
+        Err(e) => {
+            let _ = events_tx.send(log_event(
+                LogLevel::Warn,
+                format!(
+                    "[BT] {pretty}: auto-recovery failed: {e}. \
+                     Remove the device manually from Windows BT settings, \
+                     then click 'Scan for new devices'."
+                ),
+            ));
         }
     }
 }
@@ -618,11 +708,10 @@ fn tick_periodic_scan(ctx: &mut DaemonCtx, hid: &mut HidTransport, events_tx: &S
         || ctx.manual_scan_until.is_some();
     if allow_enum {
         match hid.enumerate() {
-            Ok(found) => merge_enumerated(found, ctx),
+            Ok(found) => merge_enumerated(found, ctx, events_tx),
             Err(e) => warn!("scan failed: {e}"),
         }
     }
-    let _ = events_tx; // not used here today, but kept on the signature for future scan-progress UI.
 
     let now = Instant::now();
     let candidates: Vec<String> = ctx
@@ -637,7 +726,7 @@ fn tick_periodic_scan(ctx: &mut DaemonCtx, hid: &mut HidTransport, events_tx: &S
         .map(|(id, _)| id.clone())
         .collect();
     for id in candidates {
-        if try_connect(&id, ctx, hid) {
+        if try_connect(&id, ctx, hid, events_tx) {
             if let Some(r) = ctx.registry.get_mut(&id) {
                 r.next_retry = None;
             }
@@ -648,7 +737,7 @@ fn tick_periodic_scan(ctx: &mut DaemonCtx, hid: &mut HidTransport, events_tx: &S
     }
 }
 
-fn merge_enumerated(found: Vec<DeviceInfo>, ctx: &mut DaemonCtx) {
+fn merge_enumerated(found: Vec<DeviceInfo>, ctx: &mut DaemonCtx, events_tx: &Sender<UiEvent>) {
     for f in &found {
         // Canonical key: prefer the BT MAC (stable across reconnects);
         // fall back to the HID path when no serial number is exposed.
@@ -656,12 +745,29 @@ fn merge_enumerated(found: Vec<DeviceInfo>, ctx: &mut DaemonCtx) {
         match ctx.registry.get_mut(&canonical_id) {
             Some(existing) => {
                 if existing.snapshot.path != f.id.0 {
+                    let _ = events_tx.send(log_event(
+                        LogLevel::Info,
+                        format!(
+                            "[HID] {}: path renumbered, re-binding ({} → {})",
+                            short_id(&canonical_id),
+                            short_id(&existing.snapshot.path),
+                            short_id(&f.id.0),
+                        ),
+                    ));
                     existing.snapshot.path = f.id.0.clone();
                     ctx.persist_dirty = true;
                     ctx.dirty = true;
                 }
             }
             None => {
+                let _ = events_tx.send(log_event(
+                    LogLevel::Info,
+                    format!(
+                        "[HID] new device enumerated: {} ({})",
+                        f.name,
+                        short_id(&canonical_id)
+                    ),
+                ));
                 let snap = DeviceSnapshot::new(
                     canonical_id.clone(),
                     f.name.clone(),
@@ -687,7 +793,12 @@ fn merge_enumerated(found: Vec<DeviceInfo>, ctx: &mut DaemonCtx) {
 /// Plugging ViGEm here would be wrong: on Windows `hid.open()` succeeds
 /// even for paired-but-offline Wiimotes, so we'd repeatedly plug-and-
 /// unplug a virtual Xbox 360 pad every retry cycle.
-fn try_connect(id: &str, ctx: &mut DaemonCtx, hid: &mut HidTransport) -> bool {
+fn try_connect(
+    id: &str,
+    ctx: &mut DaemonCtx,
+    hid: &mut HidTransport,
+    events_tx: &Sender<UiEvent>,
+) -> bool {
     let Some(r) = ctx.registry.get(id) else {
         return false;
     };
@@ -722,11 +833,20 @@ fn try_connect(id: &str, ctx: &mut DaemonCtx, hid: &mut HidTransport) -> bool {
             if let Some(r) = ctx.registry.get_mut(id) {
                 r.pending = true;
             }
+            let _ = events_tx.send(log_event(
+                LogLevel::Info,
+                format!(
+                    "[HID] {}: handle opened, mode 0x31 set, waiting for first report",
+                    short_id(id)
+                ),
+            ));
             true
         }
         Err(e) => {
-            // Demote to debug-level: with auto-retry on, this fires
-            // every few seconds when the Wiimote is just off.
+            // Demote to debug-level on the tracing side: with
+            // auto-retry on, this fires every few seconds when the
+            // Wiimote is just off. The UI gets a single visible line
+            // only on user-initiated Connect (handle_connect).
             debug!("open failed: {e}");
             if let Some(r) = ctx.registry.get_mut(id) {
                 r.snapshot.last_error = Some(format!("open failed: {e}"));
@@ -857,6 +977,13 @@ fn handle_report(
     // connected and plugs the virtual pad.
     let was_pending = ctx.registry.get(&id).map(|r| r.pending).unwrap_or(false);
     if was_pending {
+        let _ = events_tx.send(log_event(
+            LogLevel::Info,
+            format!(
+                "[HID] {}: first input report received — promoting to connected",
+                short_id(&id)
+            ),
+        ));
         if let Some(r) = ctx.registry.get_mut(&id) {
             r.pending = false;
         }
@@ -938,6 +1065,13 @@ fn process_extension_fsm(
                         | Some(ExtensionPhase::ReadingId)
                 );
                 if !already {
+                    let _ = events_tx.send(log_event(
+                        LogLevel::Info,
+                        format!(
+                            "[EXT] {}: extension plugged in, sending init handshake (0x55→0xa400f0)",
+                            short_id(id)
+                        ),
+                    ));
                     let _ = hid.send(
                         path_id,
                         &OutputReport::WriteRegister {
@@ -966,6 +1100,13 @@ fn process_extension_fsm(
                     r.controller.ext = None;
                 }
                 if was_present {
+                    let _ = events_tx.send(log_event(
+                        LogLevel::Info,
+                        format!(
+                            "[EXT] {}: extension unplugged, reverting to mode 0x31",
+                            short_id(id)
+                        ),
+                    ));
                     // Drop back to the no-extension reporting mode so
                     // we stop receiving 16 bytes of junk extension
                     // payload per frame.
@@ -985,6 +1126,13 @@ fn process_extension_fsm(
         } => {
             let phase = ctx.registry.get(id).and_then(|r| r.ext_phase);
             if *report_id == 0x16 && *error == 0 && phase == Some(ExtensionPhase::InitSent) {
+                let _ = events_tx.send(log_event(
+                    LogLevel::Info,
+                    format!(
+                        "[EXT] {}: init acked, reading 6-byte extension id from 0xa400fa",
+                        short_id(id)
+                    ),
+                ));
                 let _ = hid.send(
                     path_id,
                     &OutputReport::ReadRegister {
@@ -1021,9 +1169,26 @@ fn process_extension_fsm(
                     ctx.dirty = true;
                     ctx.persist_dirty = true;
                 }
+                let id_hex = id_bytes
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 let _ = events_tx.send(log_event(
                     LogLevel::Info,
-                    format!("extension on {}: {}", short_id(id), ext.label()),
+                    format!(
+                        "[EXT] {}: identified as {} (id: {})",
+                        short_id(id),
+                        ext.label(),
+                        id_hex
+                    ),
+                ));
+                let _ = events_tx.send(log_event(
+                    LogLevel::Info,
+                    format!(
+                        "[EXT] {}: switching to mode 0x35 (buttons + accel + 16B ext payload)",
+                        short_id(id)
+                    ),
                 ));
                 // Switch to mode 0x35 so the Wiimote also streams the
                 // 16-byte extension payload alongside buttons + accel.
@@ -1181,6 +1346,9 @@ fn tick_manual_scan_window(now: Instant, ctx: &mut DaemonCtx, events_tx: &Sender
     if now >= t {
         ctx.manual_scan_until = None;
         ctx.force_rescan = true;
+        // Reset the per-window auto-recovery memo so the user gets a
+        // fresh attempt the next time they click Scan.
+        ctx.sdp_recovery_attempted.clear();
         let _ = events_tx.send(UiEvent::ScanState { active_until: None });
         let _ = events_tx.send(log_event(LogLevel::Info, "scan window ended"));
     }
