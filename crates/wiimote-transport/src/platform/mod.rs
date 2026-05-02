@@ -32,26 +32,95 @@ mod windows_impl;
 #[cfg(windows)]
 pub use windows_impl::PlatformScanner;
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+mod linux_impl;
+
+#[cfg(target_os = "linux")]
+pub use linux_impl::PlatformScanner;
+
+#[cfg(target_os = "macos")]
+mod macos_impl;
+
+#[cfg(target_os = "macos")]
+pub use macos_impl::PlatformScanner;
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 pub struct PlatformScanner {
     _events: crossbeam_channel::Sender<ScannerEvent>,
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 impl PlatformScanner {
     pub fn new(events: crossbeam_channel::Sender<ScannerEvent>) -> anyhow::Result<Self> {
         Ok(Self { _events: events })
     }
 
-    /// Returns a flag the daemon can flip to suspend active Bluetooth
-    /// inquiry while a device is connected. No-op on platforms without
-    /// a real scanner.
     pub fn pause_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
     }
 
-    /// No-op until Linux (BlueZ) and macOS (IOBluetooth) backends land.
     pub fn start(&mut self) -> anyhow::Result<()> {
         Ok(())
+    }
+}
+
+/// Remove a paired device from the OS Bluetooth registry. Used by the
+/// `Forget` UI command — without this the next inquiry cycle would
+/// re-discover and re-add the device because the OS still considers it
+/// paired. Returns `Ok(())` on platforms where unpair isn't wired up
+/// yet, so the daemon's higher-level Forget bookkeeping still runs.
+#[allow(unused_variables)]
+pub fn unpair_addr(addr: u64) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        return windows_impl::unpair(addr);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return linux_impl::unpair(addr);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return macos_impl::unpair(addr);
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        Ok(())
+    }
+}
+
+/// Parse a canonical `AA:BB:CC:DD:EE:FF` MAC into the `u64` LSB-first
+/// representation used by the platform Bluetooth APIs. Returns `None`
+/// for anything that doesn't look like a colon-separated 6-byte MAC.
+pub fn mac_to_u64(mac: &str) -> Option<u64> {
+    let parts: Vec<&str> = mac.split(':').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut bytes = [0u8; 8];
+    for (i, p) in parts.iter().enumerate() {
+        bytes[i] = u8::from_str_radix(p, 16).ok()?;
+    }
+    Some(u64::from_le_bytes(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mac_to_u64;
+
+    #[test]
+    fn parses_canonical_mac() {
+        // First MAC byte ends up as the LSB of the u64.
+        let v = mac_to_u64("AA:BB:CC:DD:EE:FF").unwrap();
+        assert_eq!(v.to_le_bytes()[0], 0xAA);
+        assert_eq!(v.to_le_bytes()[5], 0xFF);
+        assert_eq!(v.to_le_bytes()[6], 0);
+    }
+
+    #[test]
+    fn rejects_bad_mac() {
+        assert!(mac_to_u64("not-a-mac").is_none());
+        assert!(mac_to_u64("AA:BB:CC:DD:EE").is_none());
+        assert!(mac_to_u64("AA:BB:CC:DD:EE:GG").is_none());
     }
 }

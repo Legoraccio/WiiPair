@@ -2,8 +2,18 @@
 //!
 //! - **Windows**: ViGEmBus virtual Xbox 360 pad (requires the ViGEmBus
 //!   driver from <https://github.com/nefarius/ViGEmBus/releases>).
-//! - **Linux/macOS**: not yet implemented (Linux: uinput; macOS: CGEvent
-//!   keyboard mapping).
+//! - **Linux**: `uinput` virtual Xbox 360 device (`/dev/uinput`).
+//! - **macOS**: CGEvent keyboard mapping fallback — modern macOS
+//!   requires a signed DriverKit driver for a real virtual gamepad.
+
+mod profile;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+
+pub use profile::MappingProfile;
 
 use wiimote_core::{Accelerometer, Buttons, ExtensionData, IrDots};
 
@@ -21,12 +31,31 @@ pub trait Output: Send {
     fn update(&mut self, state: &ControllerState) -> anyhow::Result<()>;
 }
 
+/// Build the default platform output backend with the auto-detect
+/// mapping profile.
 pub fn default_output() -> anyhow::Result<Box<dyn Output>> {
+    output_for_profile(MappingProfile::Auto)
+}
+
+/// Build the platform output backend with a specific mapping profile.
+/// On Windows that profile drives ViGEm; on Linux it drives uinput;
+/// on macOS the keyboard-mapping profiles select the CGEvent fallback
+/// while the pad-mapping profiles error out (no native virtual pad).
+#[allow(unused_variables)]
+pub fn output_for_profile(profile: MappingProfile) -> anyhow::Result<Box<dyn Output>> {
     #[cfg(windows)]
     {
-        Ok(Box::new(windows::ViGEmOutput::new()?))
+        return Ok(Box::new(windows::ViGEmOutput::new(profile)?));
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        return Ok(Box::new(linux::UinputOutput::new(profile)?));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return Ok(Box::new(macos::CGEventOutput::new(profile)?));
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         anyhow::bail!("output backend not yet implemented on this platform")
     }
@@ -34,9 +63,11 @@ pub fn default_output() -> anyhow::Result<Box<dyn Output>> {
 
 #[cfg(windows)]
 pub mod windows {
-    use super::{ControllerState, Output};
+    use super::{ControllerState, MappingProfile, Output};
     use vigem_client::{Client, TargetId, XButtons, XGamepad, Xbox360Wired};
-    use wiimote_core::{Buttons, ExtensionData, GuitarButtons, GuitarState};
+    use wiimote_core::{
+        Buttons, ClassicButtons, ClassicState, ExtensionData, GuitarButtons, GuitarState,
+    };
 
     /// Wiimote accelerometer is centred near 512 on X/Y when held flat
     /// (Z offset by gravity, ~612). Within ±DEADZONE of 512 we treat
@@ -48,10 +79,11 @@ pub mod windows {
 
     pub struct ViGEmOutput {
         target: Xbox360Wired<Client>,
+        profile: MappingProfile,
     }
 
     impl ViGEmOutput {
-        pub fn new() -> anyhow::Result<Self> {
+        pub fn new(profile: MappingProfile) -> anyhow::Result<Self> {
             let client = Client::connect().map_err(|e| {
                 anyhow::anyhow!(
                     "ViGEmBus unavailable ({e}). \
@@ -66,24 +98,120 @@ pub mod windows {
             target
                 .wait_ready()
                 .map_err(|e| anyhow::anyhow!("vigem wait_ready: {e}"))?;
-            Ok(Self { target })
+            Ok(Self { target, profile })
         }
     }
 
     impl Output for ViGEmOutput {
         fn update(&mut self, state: &ControllerState) -> anyhow::Result<()> {
-            // Pick the right mapping based on what's plugged into the
-            // Wiimote. Guitar (GH/RB) gets the Xplorer-style layout
-            // that Clone Hero understands out of the box; everything
-            // else falls back to the bare-Wiimote tilt-as-stick layout.
-            let gamepad = match &state.ext {
-                Some(ExtensionData::Guitar(g)) => guitar_gamepad(g, state),
-                _ => wiimote_gamepad(state),
+            let gamepad = match self.profile {
+                MappingProfile::Auto => match &state.ext {
+                    Some(ExtensionData::Guitar(g)) => guitar_gamepad(g, state),
+                    Some(ExtensionData::Classic(c)) => classic_gamepad(c, state),
+                    _ => wiimote_gamepad(state),
+                },
+                MappingProfile::WiimoteXbox => wiimote_gamepad(state),
+                MappingProfile::GuitarXplorer => match &state.ext {
+                    Some(ExtensionData::Guitar(g)) => guitar_gamepad(g, state),
+                    _ => wiimote_gamepad(state),
+                },
+                MappingProfile::DrumsXplorer => match &state.ext {
+                    Some(ExtensionData::Drums(d)) => drums_gamepad(d, state),
+                    _ => wiimote_gamepad(state),
+                },
+                MappingProfile::ClassicXbox => match &state.ext {
+                    Some(ExtensionData::Classic(c)) => classic_gamepad(c, state),
+                    _ => wiimote_gamepad(state),
+                },
+                // Keyboard profiles aren't applicable on Windows + ViGEm —
+                // fall back to the auto-pad mapping so the pad is still
+                // useful.
+                MappingProfile::WiimoteKeyboard | MappingProfile::GuitarKeyboard => {
+                    match &state.ext {
+                        Some(ExtensionData::Guitar(g)) => guitar_gamepad(g, state),
+                        _ => wiimote_gamepad(state),
+                    }
+                }
             };
             self.target
                 .update(&gamepad)
                 .map_err(|e| anyhow::anyhow!("vigem update: {e}"))?;
             Ok(())
+        }
+    }
+
+    fn classic_gamepad(c: &ClassicState, state: &ControllerState) -> XGamepad {
+        let mut raw: u16 = 0;
+        for (flag, xb) in [
+            (ClassicButtons::A, XButtons::A),
+            (ClassicButtons::B, XButtons::B),
+            (ClassicButtons::X, XButtons::X),
+            (ClassicButtons::Y, XButtons::Y),
+            (ClassicButtons::ZL, XButtons::LB),
+            (ClassicButtons::ZR, XButtons::RB),
+            (ClassicButtons::PLUS, XButtons::START),
+            (ClassicButtons::MINUS, XButtons::BACK),
+            (ClassicButtons::HOME, XButtons::GUIDE),
+            (ClassicButtons::DPAD_UP, XButtons::UP),
+            (ClassicButtons::DPAD_DOWN, XButtons::DOWN),
+            (ClassicButtons::DPAD_LEFT, XButtons::LEFT),
+            (ClassicButtons::DPAD_RIGHT, XButtons::RIGHT),
+        ] {
+            if c.buttons.contains(flag) {
+                raw |= xb;
+            }
+        }
+        let _ = state; // Wiimote tilt is ignored when a Classic is plugged.
+        XGamepad {
+            buttons: XButtons { raw },
+            thumb_lx: 0,
+            thumb_ly: 0,
+            thumb_rx: 0,
+            thumb_ry: 0,
+            // Classic Controller has digital L/R triggers; map to full-range.
+            left_trigger: if c.buttons.contains(ClassicButtons::LT) {
+                255
+            } else {
+                0
+            },
+            right_trigger: if c.buttons.contains(ClassicButtons::RT) {
+                255
+            } else {
+                0
+            },
+        }
+    }
+
+    fn drums_gamepad(d: &wiimote_core::DrumsState, state: &ControllerState) -> XGamepad {
+        use wiimote_core::DrumsButtons;
+        let mut raw: u16 = 0;
+        // Xplorer drum layout: red→B, yellow→Y, blue→X, green→A,
+        // orange→LB (cymbal), bass→RB (kick).
+        for (flag, xb) in [
+            (DrumsButtons::GREEN, XButtons::A),
+            (DrumsButtons::RED, XButtons::B),
+            (DrumsButtons::BLUE, XButtons::X),
+            (DrumsButtons::YELLOW, XButtons::Y),
+            (DrumsButtons::ORANGE, XButtons::LB),
+            (DrumsButtons::BASS_PEDAL, XButtons::RB),
+            (DrumsButtons::PLUS, XButtons::START),
+            (DrumsButtons::MINUS, XButtons::BACK),
+        ] {
+            if d.buttons.contains(flag) {
+                raw |= xb;
+            }
+        }
+        if state.buttons.contains(Buttons::HOME) {
+            raw |= XButtons::GUIDE;
+        }
+        XGamepad {
+            buttons: XButtons { raw },
+            thumb_lx: 0,
+            thumb_ly: 0,
+            thumb_rx: 0,
+            thumb_ry: 0,
+            left_trigger: 0,
+            right_trigger: 0,
         }
     }
 
@@ -159,8 +287,12 @@ pub mod windows {
     }
 
     fn whammy_to_axis(w: u8) -> i16 {
-        let raw = (w as i32) * 65535 / 31 - 32768;
-        raw.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+        // 5-bit range 0..=31 maps to the full i16 axis range.
+        // w.min(31) keeps the formula safe even if the parser ever lets
+        // a stray bit through; without it the result is still in range
+        // mathematically, the .min() just makes the bound explicit.
+        let w = w.min(31) as i32;
+        (w * 65535 / 31 - 32768) as i16
     }
 
     fn tilt_to_stick(raw_axis: i32) -> i16 {

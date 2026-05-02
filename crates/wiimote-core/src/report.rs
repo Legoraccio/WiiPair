@@ -224,8 +224,12 @@ fn parse_ir_extended(buf: &[u8]) -> IrDots {
 
 #[derive(Debug, Clone)]
 pub enum OutputReport {
-    /// 0x11: set player LEDs. `leds` is the low nibble (bit 0 = LED 1, …).
-    SetLeds { leds: u8 },
+    /// 0x11: set player LEDs and the rumble bit. `leds` is the low
+    /// nibble (bit 0 = LED 1, …); `rumble` toggles the rumble motor.
+    /// Bit 0 of the report's payload byte is the rumble bit, shared
+    /// across every output report — we surface it here because LEDs
+    /// is the most natural place to set it.
+    SetLeds { leds: u8, rumble: bool },
     /// 0x12: set reporting mode. `mode` is the input report ID we want.
     SetReportingMode { continuous: bool, mode: u8 },
     /// 0x15: request a status report (will arrive as 0x20).
@@ -241,7 +245,10 @@ pub enum OutputReport {
 impl OutputReport {
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Self::SetLeds { leds } => vec![0x11, (leds & 0x0F) << 4],
+            Self::SetLeds { leds, rumble } => {
+                let r = if *rumble { 0x01 } else { 0x00 };
+                vec![0x11, ((leds & 0x0F) << 4) | r]
+            }
             Self::SetReportingMode { continuous, mode } => {
                 vec![0x12, if *continuous { 0x04 } else { 0x00 }, *mode]
             }
@@ -346,9 +353,21 @@ mod tests {
     }
 
     #[test]
-    fn encodes_leds() {
-        let r = OutputReport::SetLeds { leds: 0b0001 };
+    fn encodes_leds_no_rumble() {
+        let r = OutputReport::SetLeds {
+            leds: 0b0001,
+            rumble: false,
+        };
         assert_eq!(r.encode(), vec![0x11, 0b0001_0000]);
+    }
+
+    #[test]
+    fn encodes_leds_with_rumble() {
+        let r = OutputReport::SetLeds {
+            leds: 0b0010,
+            rumble: true,
+        };
+        assert_eq!(r.encode(), vec![0x11, 0b0010_0001]);
     }
 
     #[test]

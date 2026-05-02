@@ -9,6 +9,8 @@ wiimote-core = { path = "../wiimote-core" }
 wiimote-transport = { path = "../wiimote-transport" }
 wiimote-output = { path = "../wiimote-output" }
 crossbeam-channel = { workspace = true }
-parking_lot = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::thread;
 use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::debug;
 use wiimote_core::{is_wiimote, parse_input};
 
 /// Per-device handle: outbound write channel + the join handle of the
@@ -31,8 +31,9 @@ impl HidTransport {
     }
 
     /// Re-scan and return all currently-attached Wiimote HID devices.
-    /// On Windows this requires the Wiimote to already be paired via the
-    /// OS Bluetooth stack — auto-pairing is a separate step (TODO).
+    /// Each entry carries both the OS HID `path` (for `open`) and the
+    /// BT `mac` (stable across reconnects, used by the daemon as the
+    /// canonical key).
     pub fn enumerate(&mut self) -> Result<Vec<DeviceInfo>, TransportError> {
         self.api.refresh_devices()?;
         let mut out = Vec::new();
@@ -40,12 +41,26 @@ impl HidTransport {
             if !is_wiimote(d.vendor_id(), d.product_id()) {
                 continue;
             }
-            let path = d.path().to_string_lossy().into_owned();
+            // hidapi exposes the OS device path as a CStr. Lossy UTF-8
+            // conversion would mangle bytes and break the round-trip
+            // through `CString::new` in `open()` (B15) — skip rather
+            // than corrupt. In practice all real HID paths on Win/
+            // Linux/macOS are ASCII.
+            let path_bytes = d.path().to_bytes();
+            let path = match std::str::from_utf8(path_bytes) {
+                Ok(s) => s.to_owned(),
+                Err(_) => {
+                    debug!("skipping wiimote with non-UTF-8 HID path");
+                    continue;
+                }
+            };
+            let mac = d.serial_number().and_then(format_mac);
             out.push(DeviceInfo {
                 id: DeviceId(path),
                 name: d.product_string().unwrap_or("Wii Remote").to_string(),
                 vendor_id: d.vendor_id(),
                 product_id: d.product_id(),
+                mac,
             });
         }
         Ok(out)
@@ -118,19 +133,9 @@ fn io_loop(
     /// often won't error the HID handle when the BT link drops.
     const READ_TIMEOUT_MS: i32 = 50;
     const IDLE_DEADLINE: u32 = 40;
-    /// Surface gaps between reports — healthy is ~10 ms; anything over
-    /// this is interesting (Bluetooth sniff windows, inquiry stalls,
-    /// host scheduler hiccups).
-    const GAP_WARN_MS: u128 = 80;
-    /// Don't emit gap events to the UI more often than this — gaps
-    /// often come in bursts, and a wall of identical log lines isn't
-    /// useful.
-    const GAP_EMIT_BACKOFF: Duration = Duration::from_millis(800);
 
     let mut buf = [0u8; 64];
     let mut idle_timeouts: u32 = 0;
-    let mut last_report_at: Option<std::time::Instant> = None;
-    let mut last_gap_emit: Option<std::time::Instant> = None;
     loop {
         // Drain any pending writes first — keeps latency low if the UI
         // changes LEDs / reporting mode.
@@ -178,24 +183,6 @@ fn io_loop(
             }
             Ok(n) => {
                 idle_timeouts = 0;
-                let now = std::time::Instant::now();
-                if let Some(prev) = last_report_at {
-                    let gap_ms = now.duration_since(prev).as_millis();
-                    if gap_ms > GAP_WARN_MS {
-                        let due_emit = last_gap_emit
-                            .map(|t| now.duration_since(t) >= GAP_EMIT_BACKOFF)
-                            .unwrap_or(true);
-                        if due_emit {
-                            last_gap_emit = Some(now);
-                            warn!(?id, "report gap: {} ms", gap_ms);
-                            // The UI-facing gap log is emitted by the
-                            // daemon directly off of inter-arrival
-                            // timestamps; this `warn!` is just the
-                            // terminal/stderr breadcrumb.
-                        }
-                    }
-                }
-                last_report_at = Some(now);
                 match parse_input(&buf[..n]) {
                     Ok(report) => {
                         let _ = events.send(TransportEvent::Report {
@@ -228,4 +215,25 @@ fn io_loop(
 
 fn short_id(path: &str) -> String {
     path.chars().rev().take(12).collect::<String>().chars().rev().collect()
+}
+
+/// Convert a hidapi serial number (typically a 12-char lowercase hex
+/// string for BT HID on Windows, e.g. `"e0e751b9d558"`) into the
+/// canonical `AA:BB:CC:DD:EE:FF` form. Returns `None` for anything
+/// that doesn't look like a 6-byte MAC.
+fn format_mac(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.len() != 12 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let u = s.to_ascii_uppercase();
+    Some(format!(
+        "{}:{}:{}:{}:{}:{}",
+        &u[0..2],
+        &u[2..4],
+        &u[4..6],
+        &u[6..8],
+        &u[8..10],
+        &u[10..12]
+    ))
 }

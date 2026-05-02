@@ -15,6 +15,7 @@
 
 use super::ScannerEvent;
 use crossbeam_channel::Sender;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::sync::Arc;
@@ -26,10 +27,12 @@ use windows::Win32::Devices::Bluetooth::{
     BLUETOOTH_AUTHENTICATE_RESPONSE, BLUETOOTH_AUTHENTICATION_CALLBACK_PARAMS,
     BLUETOOTH_AUTHENTICATION_METHOD_LEGACY, BLUETOOTH_DEVICE_INFO,
     BLUETOOTH_DEVICE_SEARCH_PARAMS, BLUETOOTH_FIND_RADIO_PARAMS,
-    BluetoothAuthenticateDeviceEx, BluetoothFindDeviceClose, BluetoothFindFirstDevice,
-    BluetoothFindFirstRadio, BluetoothFindNextDevice, BluetoothFindRadioClose,
-    BluetoothRegisterForAuthenticationEx, BluetoothSendAuthenticationResponseEx,
-    BluetoothSetServiceState, BluetoothUnregisterAuthentication, MITMProtectionNotRequired,
+    BluetoothAuthenticateDeviceEx, BluetoothEnumerateInstalledServices,
+    BluetoothFindDeviceClose, BluetoothFindFirstDevice, BluetoothFindFirstRadio,
+    BluetoothFindNextDevice, BluetoothFindRadioClose, BluetoothGetDeviceInfo,
+    BluetoothRegisterForAuthenticationEx, BluetoothRemoveDevice,
+    BluetoothSendAuthenticationResponseEx, BluetoothSetServiceState,
+    BluetoothUnregisterAuthentication, MITMProtectionNotRequired,
 };
 use windows::Win32::Foundation::{BOOL, CloseHandle, ERROR_SUCCESS, FALSE, HANDLE, HWND, TRUE};
 use windows::core::GUID;
@@ -104,6 +107,10 @@ fn scan_loop(
     pause: Arc<AtomicBool>,
 ) {
     info!("bluetooth scan loop started");
+    // Per-device dedup: only re-emit Discovered when (paired, connected)
+    // actually flips. Without this the UI log fills with one Discovered
+    // line per inquiry cycle (every ~3 s) for every paired Wiimote.
+    let mut last_seen: HashMap<u64, (bool, bool)> = HashMap::new();
     while !quit.load(Ordering::Relaxed) {
         if pause.load(Ordering::Relaxed) {
             // Tight poll while paused so the moment the daemon flips
@@ -137,12 +144,15 @@ fn scan_loop(
             let addr = bt_addr_u64(&dev.info);
             let paired = dev.info.fAuthenticated.as_bool();
             let connected = dev.info.fConnected.as_bool();
-            let _ = events.send(ScannerEvent::Discovered {
-                addr,
-                name: dev.name.clone(),
-                paired,
-                connected,
-            });
+            let prev = last_seen.insert(addr, (paired, connected));
+            if prev != Some((paired, connected)) {
+                let _ = events.send(ScannerEvent::Discovered {
+                    addr,
+                    name: dev.name.clone(),
+                    paired,
+                    connected,
+                });
+            }
 
             if !paired {
                 let _ = events.send(ScannerEvent::Pairing { addr });
@@ -158,7 +168,7 @@ fn scan_loop(
             }
 
             if !connected {
-                match enable_hid_service(&dev.info) {
+                match enable_hid_service(&dev.info, &events) {
                     Ok(()) => {
                         let _ = events.send(ScannerEvent::HidEnabled { addr });
                     }
@@ -280,11 +290,11 @@ unsafe extern "system" fn auth_callback(
     let params = &*p_params;
     let ctx = &*(pv_param as *const PairContext);
 
-    let _ = ctx.events.send(ScannerEvent::Error(format!(
-        "auth callback for {}: method = {:?}",
+    debug!(
+        "wiimote auth callback for {}: method = {:?}",
         format_addr_short(ctx.addr),
         params.authenticationMethod
-    )));
+    );
 
     if params.authenticationMethod != BLUETOOTH_AUTHENTICATION_METHOD_LEGACY {
         warn!(
@@ -301,18 +311,21 @@ unsafe extern "system" fn auth_callback(
     response.Anonymous.pinInfo.pinLength = 6;
     response.negativeResponse = 0;
 
-    let err = BluetoothSendAuthenticationResponseEx(ctx.h_radio, &response);
+    // Use NULL here per MS docs ("uses the radio that received the
+    // authentication request"). Passing our `ctx.h_radio` from
+    // `BluetoothFindFirstRadio` has been observed to hang indefinitely
+    // inside the driver after a manual unpair has perturbed BT state;
+    // NULL goes through the same path the BT stack already chose for
+    // this auth conversation.
+    let err = BluetoothSendAuthenticationResponseEx(HANDLE::default(), &response);
+
     if err == ERROR_SUCCESS.0 {
         debug!("wiimote auth: PIN response sent");
-        let _ = ctx.events.send(ScannerEvent::Error(format!(
-            "auth: sent legacy PIN for {}",
-            format_addr_short(ctx.addr)
-        )));
         TRUE
     } else {
         warn!("wiimote auth: SendAuthenticationResponseEx 0x{:08x}", err);
         let _ = ctx.events.send(ScannerEvent::Error(format!(
-            "auth: SendAuthenticationResponseEx 0x{err:08x}"
+            "PIN response failed: 0x{err:08x}"
         )));
         FALSE
     }
@@ -331,10 +344,10 @@ fn pair(info: &BLUETOOTH_DEVICE_INFO, events: &Sender<ScannerEvent>) -> Result<(
     // through unchanged.
     let pin: [u8; 6] = bytes;
     let addr = unsafe { info.Address.Anonymous.ullLong };
-    let _ = events.send(ScannerEvent::Error(format!(
-        "pair: PIN [{:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
+    debug!(
+        "wiimote pair: PIN [{:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
         pin[0], pin[1], pin[2], pin[3], pin[4], pin[5]
-    )));
+    );
 
     // Resolve a real local-radio handle. NULL works for
     // `BluetoothAuthenticateDeviceEx` ("try every radio") but
@@ -396,18 +409,129 @@ fn pair(info: &BLUETOOTH_DEVICE_INFO, events: &Sender<ScannerEvent>) -> Result<(
     Ok(())
 }
 
-fn enable_hid_service(info: &BLUETOOTH_DEVICE_INFO) -> Result<(), String> {
-    let info_local = *info;
-    let err = unsafe {
+fn enable_hid_service(
+    info: &BLUETOOTH_DEVICE_INFO,
+    events: &Sender<ScannerEvent>,
+) -> Result<(), String> {
+    let mut info_local = *info;
+    let err = with_radio(|h_radio| unsafe {
+        // Refresh the cached BT registry record for this device. The
+        // info returned by inquiry can be missing post-pair service
+        // entries, which can cause SetServiceState to choke with
+        // ERROR_INVALID_PARAMETER.
+        let refresh_rc = BluetoothGetDeviceInfo(h_radio, &mut info_local);
+        if refresh_rc != ERROR_SUCCESS.0 {
+            debug!("GetDeviceInfo 0x{:08x}", refresh_rc);
+        }
+
+        // List every BT service registered for this device. If the HID
+        // UUID isn't here, SetServiceState will always fail — surface
+        // a clean message to the user.
+        let mut hid_present = enumerate_services_lookup_hid(h_radio, &info_local);
+        if hid_present == ServiceLookup::Empty {
+            let _ = events.send(ScannerEvent::Error(
+                "no installed services — unpair and re-pair from Windows BT settings".into(),
+            ));
+        } else if hid_present == ServiceLookup::MissingHid {
+            let _ = events.send(ScannerEvent::Error(
+                "HID service not advertised yet — unpair and re-pair to refresh SDP cache".into(),
+            ));
+        }
+        let _ = &mut hid_present;
+
         BluetoothSetServiceState(
-            HANDLE::default(),
+            h_radio,
             &info_local,
             &HID_SERVICE_GUID,
             BLUETOOTH_SERVICE_ENABLE,
         )
-    };
+    })?;
     if err != ERROR_SUCCESS.0 {
         return Err(format!("SetServiceState 0x{err:08x}"));
     }
     Ok(())
+}
+
+#[derive(PartialEq, Eq)]
+enum ServiceLookup {
+    HidPresent,
+    MissingHid,
+    Empty,
+    Failed,
+}
+
+/// Walks the installed-services list of a paired BT device and reports
+/// whether the HID service GUID is among them. Sized dynamically so
+/// devices with >8 services aren't truncated (B5).
+unsafe fn enumerate_services_lookup_hid(
+    h_radio: HANDLE,
+    info: &BLUETOOTH_DEVICE_INFO,
+) -> ServiceLookup {
+    // First call with NULL buffer to learn the real count.
+    let mut count: u32 = 0;
+    let probe_rc = BluetoothEnumerateInstalledServices(h_radio, info, &mut count, None);
+    if probe_rc != ERROR_SUCCESS.0 && count == 0 {
+        debug!("EnumerateInstalledServices probe rc=0x{:08x}", probe_rc);
+        return ServiceLookup::Failed;
+    }
+    if count == 0 {
+        return ServiceLookup::Empty;
+    }
+    let mut services: Vec<GUID> = vec![GUID::from_u128(0); count as usize];
+    let rc = BluetoothEnumerateInstalledServices(
+        h_radio,
+        info,
+        &mut count,
+        Some(services.as_mut_ptr()),
+    );
+    if rc != ERROR_SUCCESS.0 {
+        debug!("EnumerateInstalledServices 0x{:08x}", rc);
+        return ServiceLookup::Failed;
+    }
+    let n = (count as usize).min(services.len());
+    for s in &services[..n] {
+        debug!(
+            "installed service: {:08x}-{:04x}-{:04x}",
+            s.data1, s.data2, s.data3
+        );
+        if s.data1 == 0x0000_1124 && s.data2 == 0x0000 && s.data3 == 0x1000 {
+            return ServiceLookup::HidPresent;
+        }
+    }
+    ServiceLookup::MissingHid
+}
+
+/// Unpair a device from the local Bluetooth radio. Used by the daemon
+/// when the user clicks "Forget" — without this the next BT inquiry
+/// would re-discover the still-paired device and re-add it.
+pub fn unpair(addr: u64) -> Result<(), String> {
+    let address = windows::Win32::Devices::Bluetooth::BLUETOOTH_ADDRESS {
+        Anonymous:
+            windows::Win32::Devices::Bluetooth::BLUETOOTH_ADDRESS_0 { ullLong: addr },
+    };
+    let rc = unsafe { BluetoothRemoveDevice(&address) };
+    if rc == ERROR_SUCCESS.0 {
+        Ok(())
+    } else {
+        Err(format!("BluetoothRemoveDevice 0x{rc:08x}"))
+    }
+}
+
+/// Open the local Bluetooth radio, run `f` with its handle, then close
+/// the handle. NULL/default doesn't work reliably for several BT APIs
+/// when the system has more than one paired device — the stack can't
+/// disambiguate which radio routes the call.
+fn with_radio<T>(f: impl FnOnce(HANDLE) -> T) -> Result<T, String> {
+    let radio_params = BLUETOOTH_FIND_RADIO_PARAMS {
+        dwSize: size_of::<BLUETOOTH_FIND_RADIO_PARAMS>() as u32,
+    };
+    let mut h_radio: HANDLE = HANDLE::default();
+    let h_find = match unsafe { BluetoothFindFirstRadio(&radio_params, &mut h_radio) } {
+        Ok(h) => h,
+        Err(_) => return Err("no Bluetooth radio found".into()),
+    };
+    let _ = unsafe { BluetoothFindRadioClose(h_find) };
+    let result = f(h_radio);
+    let _ = unsafe { CloseHandle(h_radio) };
+    Ok(result)
 }

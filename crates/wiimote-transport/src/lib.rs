@@ -25,6 +25,10 @@ pub struct DeviceInfo {
     pub name: String,
     pub vendor_id: u16,
     pub product_id: u16,
+    /// Bluetooth MAC formatted `AA:BB:CC:DD:EE:FF` (uppercase) when
+    /// available. The daemon uses this as the canonical key — it's
+    /// stable across power cycles and Windows path renumbering.
+    pub mac: Option<String>,
 }
 
 #[derive(Debug)]

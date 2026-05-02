@@ -8,7 +8,6 @@ license.workspace = true
 wiimote-core = { path = "../wiimote-core" }
 hidapi = "2"
 crossbeam-channel = { workspace = true }
-parking_lot = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -18,3 +17,14 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Devices_Bluetooth",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bluer = { version = "0.17", features = ["bluetoothd"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+futures-util = "0.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.9"
+# IOBluetooth bindings come in via objc2; no separate crate.
+objc2 = "0.5"
+objc2-foundation = "0.2"

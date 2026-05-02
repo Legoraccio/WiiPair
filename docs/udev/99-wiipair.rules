@@ -1,0 +1,19 @@
+# WiiPair udev rules — give the `input` group:
+#   * read access to /dev/hidraw* for paired Wiimotes (so hidapi can
+#     talk to them without root);
+#   * read+write access to /dev/uinput so the virtual Xbox 360 pad
+#     can be created.
+#
+# Install:
+#   sudo cp 99-wiipair.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger
+#   sudo usermod -aG input "$USER"
+#   # then log out and back in so the new group sticks.
+
+# Wiimote (RVL-CNT-01)
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="057e", ATTRS{idProduct}=="0306", MODE="0660", GROUP="input"
+# Wiimote Plus (RVL-CNT-01-TR)
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="057e", ATTRS{idProduct}=="0330", MODE="0660", GROUP="input"
+
+# uinput — virtual Xbox 360 controller output.
+KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
