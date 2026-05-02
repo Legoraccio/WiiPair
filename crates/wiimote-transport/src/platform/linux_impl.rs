@@ -166,9 +166,8 @@ async fn scan_loop(
 
 async fn register_agent(
     session: &Session,
-    events: &Sender<ScannerEvent>,
+    _events: &Sender<ScannerEvent>,
 ) -> bluer::Result<AgentHandle> {
-    let events_pin = events.clone();
     let agent = Agent {
         request_default: true,
         request_pin_code: Some(Box::new(move |req: RequestPinCode| {
@@ -178,12 +177,8 @@ async fn register_agent(
             // the raw 6 bytes verbatim — every Wiimote firmware we've
             // seen accepts the bytes regardless of UTF-8 validity.
             let pin = pin_for_address(req.device);
-            let events = events_pin.clone();
             Box::pin(async move {
-                let _ = events.send(ScannerEvent::Error(format!(
-                    "auth: sending PIN to {}",
-                    address_short(req.device)
-                )));
+                debug!("wiimote auth: sending PIN to {}", address_short(req.device));
                 ReqResult::Ok(pin)
             })
         })),
@@ -238,6 +233,12 @@ async fn handle_discovered(
     }
     let paired = device.is_paired().await.unwrap_or(false);
     let connected = device.is_connected().await.unwrap_or(false);
+    // RSSI is `Some` only when the device has been heard in the
+    // current/recent inquiry. BlueZ surfaces cached entries from past
+    // sessions even when they aren't advertising right now — pairing
+    // those produces the dreaded "Page Timeout" error because the
+    // baseband connection phase has nothing to talk to.
+    let rssi = device.rssi().await.ok().flatten();
     let u64_addr = address_to_u64(addr);
     let _ = events.send(ScannerEvent::Discovered {
         addr: u64_addr,
@@ -247,15 +248,38 @@ async fn handle_discovered(
     });
 
     if !paired {
+        if rssi.is_none() {
+            debug!(
+                "skipping pair on cached-only device {addr} (no RSSI — not advertising)"
+            );
+            return Ok(());
+        }
         let _ = events.send(ScannerEvent::Pairing { addr: u64_addr });
         match device.pair().await {
             Ok(()) => {
                 let _ = events.send(ScannerEvent::Paired { addr: u64_addr });
             }
             Err(e) => {
+                let raw = format!("{e}");
+                // Page Timeout = baseband paging didn't get a reply.
+                // Almost always: the user let go of 1+2 and the
+                // Wiimote dropped out of pairing mode before BlueZ
+                // could finish the handshake. Nudge them and clear
+                // the cached device entry so the next inquiry starts
+                // from scratch.
+                let reason = if raw.contains("Page Timeout") {
+                    let _ = adapter.remove_device(addr).await;
+                    format!(
+                        "{raw} — keep holding 1+2 on the Wiimote (the 4 LEDs \
+                         must stay blinking 1→2→3→4) until pairing completes, \
+                         then re-trigger the scan."
+                    )
+                } else {
+                    raw
+                };
                 let _ = events.send(ScannerEvent::PairFailed {
                     addr: u64_addr,
-                    reason: format!("{e}"),
+                    reason,
                 });
                 return Ok(());
             }
