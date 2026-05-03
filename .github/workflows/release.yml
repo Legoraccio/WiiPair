@@ -14,6 +14,13 @@ on:
 permissions:
   contents: write   # needed to create the GitHub Release
 
+# Opt every JavaScript-based action into Node 24 ahead of the default
+# switchover (June 2026). Avoids the "Node.js 20 actions are deprecated"
+# warning without having to wait for each third-party action to ship
+# a v5 / Node 24 release of its own.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   # ---------------------------------------------------------------------
   # Sanity check: the tag version must match the workspace version in
