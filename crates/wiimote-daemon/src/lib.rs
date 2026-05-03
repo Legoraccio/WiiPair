@@ -788,19 +788,20 @@ fn merge_enumerated(found: Vec<DeviceInfo>, ctx: &mut DaemonCtx, events_tx: &Sen
         // device. Without this we'd insert a fresh MAC-keyed entry and
         // leave the path-keyed one floating around as a duplicate.
         if let Some(mac) = &f.mac {
-            if mac != &f.id.0 && ctx.registry.get(&f.id.0).is_some() {
-                if ctx.registry.rekey(&f.id.0, mac) {
-                    let _ = events_tx.send(log_event(
-                        LogLevel::Info,
-                        format!(
-                            "[HID] migrated legacy entry to MAC: {} → {}",
-                            short_id(&f.id.0),
-                            short_id(mac)
-                        ),
-                    ));
-                    ctx.persist_dirty = true;
-                    ctx.dirty = true;
-                }
+            if mac != &f.id.0
+                && ctx.registry.get(&f.id.0).is_some()
+                && ctx.registry.rekey(&f.id.0, mac)
+            {
+                let _ = events_tx.send(log_event(
+                    LogLevel::Info,
+                    format!(
+                        "[HID] migrated legacy entry to MAC: {} → {}",
+                        short_id(&f.id.0),
+                        short_id(mac)
+                    ),
+                ));
+                ctx.persist_dirty = true;
+                ctx.dirty = true;
             }
         }
 

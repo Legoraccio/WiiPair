@@ -84,15 +84,15 @@ impl PlatformScanner {
 pub fn unpair_addr(addr: u64) -> Result<(), String> {
     #[cfg(windows)]
     {
-        return windows_impl::unpair(addr);
+        windows_impl::unpair(addr)
     }
     #[cfg(target_os = "linux")]
     {
-        return linux_impl::unpair(addr);
+        linux_impl::unpair(addr)
     }
     #[cfg(target_os = "macos")]
     {
-        return macos_impl::unpair(addr);
+        macos_impl::unpair(addr)
     }
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {

@@ -161,18 +161,17 @@ pub fn pairing_stuck_dialog(ctx: &egui::Context, addr: u64) -> bool {
                 if ui.button("Got it").clicked() {
                     close = true;
                 }
-                if cfg!(target_os = "windows") {
-                    if ui
+                if cfg!(target_os = "windows")
+                    && ui
                         .button("Open Bluetooth settings")
                         .on_hover_text(
                             "Opens the Windows Bluetooth & devices page so you can toggle the radio off/on.",
                         )
                         .clicked()
-                    {
-                        let _ = std::process::Command::new("cmd")
-                            .args(["/C", "start", "ms-settings:bluetooth"])
-                            .spawn();
-                    }
+                {
+                    let _ = std::process::Command::new("cmd")
+                        .args(["/C", "start", "ms-settings:bluetooth"])
+                        .spawn();
                 }
             });
         });

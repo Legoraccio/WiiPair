@@ -31,12 +31,6 @@ pub trait Output: Send {
     fn update(&mut self, state: &ControllerState) -> anyhow::Result<()>;
 }
 
-/// Build the default platform output backend with the auto-detect
-/// mapping profile.
-pub fn default_output() -> anyhow::Result<Box<dyn Output>> {
-    output_for_profile(MappingProfile::Auto)
-}
-
 /// Cheap smoke test for the platform output backend, run by the UI at
 /// startup so the user gets a clear "install ViGEmBus" dialog *before*
 /// they pair their first Wiimote — instead of finding out only when
@@ -51,17 +45,17 @@ pub fn default_output() -> anyhow::Result<Box<dyn Output>> {
 pub fn probe_default() -> Result<(), ProbeFailure> {
     #[cfg(windows)]
     {
-        return match vigem_client::Client::connect() {
+        match vigem_client::Client::connect() {
             Ok(_) => Ok(()),
             Err(e) => Err(ProbeFailure {
                 kind: ProbeKind::ViGEmBusMissing,
                 detail: format!("{e}"),
             }),
-        };
+        }
     }
     #[cfg(target_os = "linux")]
     {
-        return match std::fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .write(true)
             .open("/dev/uinput")
         {
@@ -70,7 +64,7 @@ pub fn probe_default() -> Result<(), ProbeFailure> {
                 kind: ProbeKind::UinputUnavailable,
                 detail: format!("{e}"),
             }),
-        };
+        }
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
@@ -104,15 +98,15 @@ pub enum ProbeKind {
 pub fn output_for_profile(profile: MappingProfile) -> anyhow::Result<Box<dyn Output>> {
     #[cfg(windows)]
     {
-        return Ok(Box::new(windows::ViGEmOutput::new(profile)?));
+        Ok(Box::new(windows::ViGEmOutput::new(profile)?))
     }
     #[cfg(target_os = "linux")]
     {
-        return Ok(Box::new(linux::UinputOutput::new(profile)?));
+        Ok(Box::new(linux::UinputOutput::new(profile)?))
     }
     #[cfg(target_os = "macos")]
     {
-        return Ok(Box::new(macos::CGEventOutput::new(profile)?));
+        Ok(Box::new(macos::CGEventOutput::new(profile)?))
     }
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {

@@ -14,8 +14,9 @@ use serde::{Deserialize, Serialize};
 /// best-fit layout based on which extension is currently plugged in
 /// (Wiimote → Xbox, Guitar → Xplorer, Drums → Xplorer drums, Classic
 /// → Xbox).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum MappingProfile {
+    #[default]
     Auto,
     /// Bare Wiimote → Xbox 360 pad: tilt → left stick, A/B → A/B,
     /// 1/2 → X/Y, +/− → Start/Back, Home → Guide.
@@ -63,8 +64,3 @@ impl MappingProfile {
     }
 }
 
-impl Default for MappingProfile {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
