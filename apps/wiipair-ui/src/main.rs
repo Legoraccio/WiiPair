@@ -1,3 +1,9 @@
+// On a release build for Windows we don't want the secondary console
+// window to pop up alongside the GUI. Debug builds keep the console
+// so `tracing` output stays visible during development. Other
+// platforms ignore the attribute.
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+
 mod device_card;
 mod dialogs;
 mod icons;
