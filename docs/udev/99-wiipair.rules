@@ -10,10 +10,16 @@
 #   sudo usermod -aG input "$USER"
 #   # then log out and back in so the new group sticks.
 
-# Wiimote (RVL-CNT-01)
-KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="057e", ATTRS{idProduct}=="0306", MODE="0660", GROUP="input"
-# Wiimote Plus (RVL-CNT-01-TR)
-KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="057e", ATTRS{idProduct}=="0330", MODE="0660", GROUP="input"
+# Wiimote / Wiimote Plus, both paths:
+#   - Modern kernels (>= 3.11) auto-bind the `hid-wiimote` driver,
+#     producing /devices/virtual/misc/uhid/0005:057E:030[6F].* — the
+#     hidraw exposed there has *no* idVendor/idProduct ATTRS visible,
+#     so we match on the parent HID driver name instead.
+#   - Older or non-bound setups expose the USB ATTRS the usual way,
+#     and KERNELS=="0005:057E:*" still matches them.
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", DRIVERS=="wiimote", MODE="0660", GROUP="input"
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", KERNELS=="0005:057E:0306.*", MODE="0660", GROUP="input"
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", KERNELS=="0005:057E:0330.*", MODE="0660", GROUP="input"
 
 # uinput — virtual Xbox 360 controller output.
 KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"

@@ -141,7 +141,7 @@ fn io_loop(
         // changes LEDs / reporting mode.
         loop {
             match writes.try_recv() {
-                Ok(mut payload) => {
+                Ok(payload) => {
                     // Windows' HID stack rejects writes shorter than
                     // the device's max output-report size; for the
                     // Wiimote that's 22 bytes (1 ID + 21 data). Without
@@ -185,6 +185,20 @@ fn io_loop(
                 idle_timeouts = 0;
                 match parse_input(&buf[..n]) {
                     Ok(report) => {
+                        // Temp diagnostic: every ~50 reports log the
+                        // report ID so we can confirm what mode the
+                        // Wiimote is actually streaming in. If we only
+                        // ever see 0x30 (buttons-only) despite asking
+                        // for 0x35, something downstream is overriding
+                        // our SetReportingMode (kernel hid-wiimote
+                        // module is the prime suspect on Linux).
+                        debug!(
+                            target: "wiimote_transport::report",
+                            "{}: parsed report id 0x{:02x} ({} bytes)",
+                            short_id(&id.0),
+                            buf[0],
+                            n
+                        );
                         let _ = events.send(TransportEvent::Report {
                             id: id.clone(),
                             report,

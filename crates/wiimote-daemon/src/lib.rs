@@ -13,6 +13,9 @@
 
 mod persist;
 mod state;
+pub mod ui_log;
+
+pub use ui_log::{UiLogLayer, install_ui_log_sender};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use std::collections::{HashMap, HashSet};
@@ -98,10 +101,27 @@ pub enum UiEvent {
 }
 
 fn log_event(level: LogLevel, message: impl Into<String>) -> UiEvent {
+    let message = message.into();
+    // Mirror to tracing so the same line shows up on stderr when the
+    // user runs the binary from a terminal. The `LOG_TARGET_DIRECT`
+    // marker tells the UI tracing layer to skip these — they're
+    // already going to the UI via the `UiEvent::Log` we return below,
+    // and we don't want them counted twice.
+    match level {
+        LogLevel::Info => {
+            tracing::info!(target: ui_log::LOG_TARGET_DIRECT, "{message}")
+        }
+        LogLevel::Warn => {
+            tracing::warn!(target: ui_log::LOG_TARGET_DIRECT, "{message}")
+        }
+        LogLevel::Error => {
+            tracing::error!(target: ui_log::LOG_TARGET_DIRECT, "{message}")
+        }
+    }
     UiEvent::Log {
         at: SystemTime::now(),
         level,
-        message: message.into(),
+        message,
     }
 }
 
@@ -138,6 +158,9 @@ pub enum UiCommand {
 pub struct Daemon {
     pub events_rx: Receiver<UiEvent>,
     pub commands_tx: Sender<UiCommand>,
+    /// Clone handed to `UiLogLayer` so the tracing bridge can post
+    /// log lines into the same channel the daemon already feeds.
+    events_tx: Sender<UiEvent>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -158,11 +181,12 @@ impl Daemon {
         let (events_tx, events_rx) = unbounded();
         let (commands_tx, commands_rx) = unbounded();
 
+        let events_tx_thread = events_tx.clone();
         let handle = thread::Builder::new()
             .name("wiimote-daemon".into())
             .spawn(move || {
-                if let Err(e) = run(events_tx.clone(), commands_rx) {
-                    let _ = events_tx.send(log_event(
+                if let Err(e) = run(events_tx_thread.clone(), commands_rx) {
+                    let _ = events_tx_thread.send(log_event(
                         LogLevel::Error,
                         format!("daemon stopped: {e}"),
                     ));
@@ -172,8 +196,15 @@ impl Daemon {
         Ok(Self {
             events_rx,
             commands_tx,
+            events_tx,
             thread: Some(handle),
         })
+    }
+
+    /// Hand out a sender clone so the tracing-to-UI bridge can post
+    /// log lines into the same channel the daemon already feeds.
+    pub fn log_sender(&self) -> Sender<UiEvent> {
+        self.events_tx.clone()
     }
 }
 
@@ -1230,19 +1261,29 @@ fn process_extension_fsm(
                             short_id(id)
                         ),
                     ));
-                    // Drop back to the no-extension reporting mode so
-                    // we stop receiving 16 bytes of junk extension
-                    // payload per frame.
-                    let _ = hid.send(
-                        path_id,
-                        &OutputReport::SetReportingMode {
-                            continuous: true,
-                            mode: 0x31,
-                        }
-                        .encode(),
-                    );
                 }
             }
+
+            // Wiimote spec: every Status response resets the
+            // reporting mode back to 0x30 (default, buttons-only).
+            // Without re-affirming our mode here, the daemon's 200 ms
+            // keepalive `RequestStatus` would silently kill accel +
+            // extension data as soon as the first status reply
+            // lands — which is exactly what masked the
+            // accelerometer + Guitar Hero extension reports on
+            // Linux for an entire debug session.
+            let mode = match ctx.registry.get(id).and_then(|r| r.ext_phase) {
+                Some(ExtensionPhase::Identified(_)) => 0x35,
+                _ => 0x31,
+            };
+            let _ = hid.send(
+                path_id,
+                &OutputReport::SetReportingMode {
+                    continuous: true,
+                    mode,
+                }
+                .encode(),
+            );
         }
         InputReport::Ack {
             report_id, error, ..

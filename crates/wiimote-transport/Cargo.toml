@@ -22,6 +22,7 @@ windows = { version = "0.58", features = [
 bluer = { version = "0.17", features = ["bluetoothd"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 futures-util = "0.3"
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.9"

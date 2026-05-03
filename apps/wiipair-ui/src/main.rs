@@ -4,6 +4,8 @@
 // platforms ignore the attribute.
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
+#[cfg(target_os = "linux")]
+mod cap_self_grant;
 mod device_card;
 mod dialogs;
 mod icon;
@@ -13,18 +15,40 @@ mod widgets;
 use chrono::{DateTime, Local};
 use eframe::egui;
 use std::collections::VecDeque;
-use wiimote_daemon::{Daemon, DeviceSnapshot, LogLevel, UiCommand, UiEvent};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use wiimote_daemon::{Daemon, DeviceSnapshot, LogLevel, UiCommand, UiEvent, UiLogLayer};
 use wiimote_output::{ProbeFailure, probe_default};
 
 fn main() -> eframe::Result {
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    // Wiimote pairing's PIN reply runs on the kernel mgmt socket
+    // (only path that carries raw bytes). Binding it needs
+    // CAP_NET_ADMIN. If we're missing it, ask polkit to grant it
+    // ourselves before any UI is shown — the user sees one password
+    // prompt the first time after each rebuild, then we re-exec into
+    // the now-capable binary and continue normally.
+    #[cfg(target_os = "linux")]
+    cap_self_grant::ensure_cap_net_admin();
+
+    // Two sinks for one source: stderr fmt for terminal users, plus
+    // a layer that mirrors info/warn/error from `wiimote_*` modules
+    // into the UI log panel so the user doesn't have to consult two
+    // places to understand what just happened.
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with(tracing_subscriber::fmt::layer())
+        .with(UiLogLayer)
         .init();
 
     let daemon = Daemon::start().expect("daemon failed to start");
+    // Wire the layer's sink up now that the daemon has created its
+    // event channel. Tracing events emitted in the brief window
+    // before this point are dropped — that's only the very first
+    // frames of `Daemon::start`, which carry no user-relevant info.
+    wiimote_daemon::install_ui_log_sender(daemon.log_sender());
     // Probe the platform output backend before showing the UI so a
     // missing ViGEmBus / unwritable /dev/uinput surfaces as a dedicated
     // dialog at startup instead of a cryptic per-row error after the
