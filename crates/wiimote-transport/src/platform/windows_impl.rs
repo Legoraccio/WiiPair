@@ -35,7 +35,8 @@ use windows::Win32::Devices::Bluetooth::{
     BluetoothUnregisterAuthentication, MITMProtectionNotRequired,
 };
 use windows::Win32::Foundation::{
-    BOOL, CloseHandle, ERROR_INVALID_PARAMETER, ERROR_SUCCESS, FALSE, HANDLE, HWND, TRUE,
+    BOOL, CloseHandle, ERROR_GEN_FAILURE, ERROR_INVALID_PARAMETER, ERROR_SUCCESS, FALSE, HANDLE,
+    HWND, TRUE,
 };
 use windows::core::GUID;
 
@@ -406,6 +407,15 @@ fn pair(info: &BLUETOOTH_DEVICE_INFO, events: &Sender<ScannerEvent>) -> Result<(
     let _ = unsafe { Box::from_raw(ctx) };
 
     if auth_err != ERROR_SUCCESS.0 {
+        // ERROR_GEN_FAILURE (0x1F) here means the BT registry has a
+        // stale "paired=false, connected=true" entry that the stack
+        // refuses to re-auth. Surface it so the daemon can purge the
+        // device and force a clean re-discovery instead of letting
+        // the user wait through ~12 retries before Windows times out
+        // the stale state on its own.
+        if auth_err == ERROR_GEN_FAILURE.0 {
+            let _ = events.send(ScannerEvent::AuthStuck { addr });
+        }
         return Err(format!("AuthenticateDeviceEx 0x{auth_err:08x}"));
     }
     Ok(())

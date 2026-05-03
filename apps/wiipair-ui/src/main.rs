@@ -29,10 +29,15 @@ fn main() -> eframe::Result {
     // dialog at startup instead of a cryptic per-row error after the
     // first Wiimote connects.
     let driver_probe = probe_default().err();
+    // The device card footer (battery + tilt disc + IR canvas + profile
+    // dropdown) and the Wiimote+extension live-state body don't fit
+    // below ~820x540 without overlapping each other. The previous
+    // 640x420 minimum let the user shrink the window to a state where
+    // widgets clipped through one another.
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 600.0])
-            .with_min_inner_size([640.0, 420.0])
+            .with_inner_size([960.0, 640.0])
+            .with_min_inner_size([820.0, 540.0])
             .with_title("WiiPair"),
         ..Default::default()
     };

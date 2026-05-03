@@ -626,29 +626,72 @@ fn handle_scanner_event(ev: ScannerEvent, ctx: &mut DaemonCtx, events_tx: &Sende
             ));
             ctx.force_rescan = true;
         }
-        ScannerEvent::SdpCacheStale { addr } => handle_sdp_cache_stale(addr, ctx, events_tx),
+        ScannerEvent::SdpCacheStale { addr } => {
+            handle_bt_state_stuck(addr, StuckReason::SdpCache, ctx, events_tx)
+        }
+        ScannerEvent::AuthStuck { addr } => {
+            handle_bt_state_stuck(addr, StuckReason::Auth, ctx, events_tx)
+        }
         ScannerEvent::Error(e) => {
             let _ = events_tx.send(log_event(LogLevel::Warn, format!("[BT] {e}")));
         }
     }
 }
 
-/// Auto-recover the Wii Remote Plus SDP-cache-stale issue: depair the
+#[derive(Clone, Copy)]
+enum StuckReason {
+    /// Wii Remote Plus / Windows: HID service entry is stale, every
+    /// `BluetoothSetServiceState` returns `ERROR_INVALID_PARAMETER`.
+    SdpCache,
+    /// Windows: `BluetoothAuthenticateDeviceEx` returns
+    /// `ERROR_GEN_FAILURE` because the registry holds a half-paired
+    /// `connected=true,paired=false` entry the stack refuses to re-auth.
+    Auth,
+}
+
+impl StuckReason {
+    fn passive_message(self, pretty: &str) -> String {
+        match self {
+            StuckReason::SdpCache => format!(
+                "[BT] {pretty}: HID service not advertised (stale SDP cache). \
+                 Click 'Scan for new devices' and press 1+2 to auto-recover."
+            ),
+            StuckReason::Auth => format!(
+                "[BT] {pretty}: stuck auth state (BT registry holds a half-paired \
+                 entry). Click 'Scan for new devices' and press 1+2 to auto-recover."
+            ),
+        }
+    }
+
+    fn detected_message(self, pretty: &str) -> String {
+        match self {
+            StuckReason::SdpCache => format!(
+                "[BT] {pretty}: stale SDP cache detected — auto-recovering \
+                 (unpairing now; keep holding 1+2 on the Wiimote)…"
+            ),
+            StuckReason::Auth => format!(
+                "[BT] {pretty}: stuck auth state detected (ERROR_GEN_FAILURE) — \
+                 auto-recovering (unpairing now; keep holding 1+2 on the Wiimote)…"
+            ),
+        }
+    }
+}
+
+/// Auto-recover from a stuck Bluetooth-registry state: depair the
 /// device, force a rescan so the next inquiry sees it as fresh, and
 /// the rest of the auto-pair flow handles it from there. Gated on a
 /// manual scan window being active — outside of that the user isn't
 /// expected to be holding 1+2, and depairing a "good but offline"
 /// device would just leave them confused.
-fn handle_sdp_cache_stale(addr: u64, ctx: &mut DaemonCtx, events_tx: &Sender<UiEvent>) {
+fn handle_bt_state_stuck(
+    addr: u64,
+    reason: StuckReason,
+    ctx: &mut DaemonCtx,
+    events_tx: &Sender<UiEvent>,
+) {
     let pretty = format_addr(addr);
     if ctx.manual_scan_until.is_none() {
-        let _ = events_tx.send(log_event(
-            LogLevel::Warn,
-            format!(
-                "[BT] {pretty}: HID service not advertised (stale SDP cache). \
-                 Click 'Scan for new devices' and press 1+2 to auto-recover."
-            ),
-        ));
+        let _ = events_tx.send(log_event(LogLevel::Warn, reason.passive_message(&pretty)));
         return;
     }
     // Don't fire repeatedly for the same device within one scan window.
@@ -657,10 +700,7 @@ fn handle_sdp_cache_stale(addr: u64, ctx: &mut DaemonCtx, events_tx: &Sender<UiE
     }
     let _ = events_tx.send(log_event(
         LogLevel::Info,
-        format!(
-            "[BT] {pretty}: stale SDP cache detected — auto-recovering \
-             (unpairing now; keep holding 1+2 on the Wiimote)…"
-        ),
+        reason.detected_message(&pretty),
     ));
     match unpair_addr(addr) {
         Ok(()) => {
@@ -684,7 +724,7 @@ fn handle_sdp_cache_stale(addr: u64, ctx: &mut DaemonCtx, events_tx: &Sender<UiE
                 LogLevel::Warn,
                 format!(
                     "[BT] {pretty}: auto-recovery failed: {e}. \
-                     Remove the device manually from Windows BT settings, \
+                     Remove the device manually from your OS BT settings, \
                      then click 'Scan for new devices'."
                 ),
             ));
@@ -869,10 +909,15 @@ fn try_connect(
             // auto-retry on, this fires every few seconds when the
             // Wiimote is just off. The UI gets a single visible line
             // only on user-initiated Connect (handle_connect).
+            //
+            // We deliberately *don't* surface this into the per-row
+            // last_error: a paired-but-offline Wiimote is the normal
+            // resting state, the open-circle dot already conveys it,
+            // and a red "Impossibile trovare il file specificato" on
+            // every offline row is just noise. last_error stays
+            // reserved for genuine misconfigurations (no virtual pad
+            // available, slot cap reached, …).
             debug!("open failed: {e}");
-            if let Some(r) = ctx.registry.get_mut(id) {
-                r.snapshot.last_error = Some(format!("open failed: {e}"));
-            }
             false
         }
     }

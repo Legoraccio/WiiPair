@@ -28,6 +28,11 @@ pub enum ScannerEvent {
     /// the device is unpaired and re-paired. The daemon uses this as
     /// a trigger to auto-recover during a manual scan window.
     SdpCacheStale { addr: u64 },
+    /// `BluetoothAuthenticateDeviceEx` came back with
+    /// `ERROR_GEN_FAILURE` (0x1F) — the BT registry has a stale
+    /// `paired=false, connected=true` entry that the OS won't let us
+    /// re-auth. Same recovery path as `SdpCacheStale`.
+    AuthStuck { addr: u64 },
     /// Non-fatal scanner-level error (e.g. inquiry failed once).
     Error(String),
 }
