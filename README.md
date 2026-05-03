@@ -1,6 +1,6 @@
 # WiiPair
 
-![WiiPair — a Wiimote-shaped monolith on a moonscape, surrounded by curious primates with Wii instruments and a pile of controllers](assets/banner.png)
+![WiiPair — a Wiimote-shaped monolith on a moonscape, surrounded by curious primates with Wii instruments and a pile of controllers](assets/banner.jpg)
 
 > ⚠️ **Beta software.** WiiPair handles low-level Bluetooth and virtual-driver
 > plumbing on three operating systems. Some BT chipsets and OS combinations
