@@ -141,7 +141,7 @@ fn io_loop(
         // changes LEDs / reporting mode.
         loop {
             match writes.try_recv() {
-                Ok(payload) => {
+                Ok(mut payload) => {
                     // Windows' HID stack rejects writes shorter than
                     // the device's max output-report size; for the
                     // Wiimote that's 22 bytes (1 ID + 21 data). Without
