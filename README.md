@@ -280,18 +280,26 @@ picks it up.
 
 ## Troubleshooting
 
-### Wii Remote Plus (`RVL-CNT-01-TR`) — Windows
+### Wii Remote Plus (`RVL-CNT-01-TR`) and stuck-pairing recovery — Windows
 
-The Wii Remote Plus has a Windows-side quirk: after a power-cycle the
-OS holds onto stale Bluetooth service entries from the previous
-session, and `BluetoothSetServiceState(HID)` fails with a generic
-`ERROR_INVALID_PARAMETER` until the device is removed and re-paired.
+The Wii Remote Plus has two known Windows-side quirks that surface
+after a power-cycle:
 
-**WiiPair handles this for you.** When the scanner detects the
-stale-SDP-cache signature *during an active "Scan for new devices"
+* **Stale SDP cache** — Windows holds onto BT service entries from the
+  previous session. `BluetoothSetServiceState(HID)` fails with
+  `ERROR_INVALID_PARAMETER` (0x57) until the device is removed and
+  re-paired.
+* **Stuck auth state** — the BT registry holds a half-paired entry
+  (`paired=false, connected=true`). `BluetoothAuthenticateDeviceEx`
+  refuses to start with `ERROR_GEN_FAILURE` (0x1F) and Windows can
+  take well over a minute to clear it on its own.
+
+**WiiPair detects both signatures and auto-recovers.** When the
+scanner spots either error *during an active "Scan for new devices"
 window*, it:
 
-1. Logs `[BT] AA:BB:…: stale SDP cache detected — auto-recovering`.
+1. Logs `[BT] AA:BB:…: stale SDP cache detected` *or*
+   `stuck auth state detected (ERROR_GEN_FAILURE)`.
 2. Calls `BluetoothRemoveDevice` to drop the stale pairing.
 3. Forces an immediate re-scan so the next inquiry sees the Wiimote
    as fresh and re-pairs it from scratch using the legacy 1+2 PIN.
@@ -302,13 +310,12 @@ runs. No need to open Windows BT settings.
 
 Auto-recovery only fires while a manual scan window is active — outside
 of it the daemon won't depair a "good but offline" device, since
-without 1+2 held the next inquiry won't find it again. If you see the
-log line `HID service not advertised (stale SDP cache)` outside a scan
-window, click **Scan for new devices** and press 1+2 to trigger the
-recovery.
+without 1+2 held the next inquiry won't find it again. If you see one
+of those log lines outside a scan window, click **Scan for new
+devices** and press 1+2 to trigger the recovery.
 
-The original Wii Remote (`RVL-CNT-01`) doesn't have this issue on most
-Windows builds.
+The original Wii Remote (`RVL-CNT-01`) doesn't usually trip either
+quirk on most Windows builds.
 
 ### Pairing hangs
 
@@ -350,10 +357,18 @@ controller still works as a bare Wiimote.
 
 ### "Virtual controller output unavailable" (Windows)
 
-ViGEmBus isn't installed or the driver isn't running. Reinstall it from
-the [ViGEmBus releases page](https://github.com/nefarius/ViGEmBus/releases)
-and reboot. If you have **HidHide** installed, check that it isn't
-hiding the Wiimote's raw HID — that confuses ViGEm's plug routine.
+ViGEmBus isn't installed or the driver isn't running. WiiPair pops a
+dedicated install dialog at startup (with a button to the download
+page) when the probe fails outright. If the message appears later
+(during a connect cycle), the daemon now retries `output_for_profile`
+every ~3 s in the background and clears the red error as soon as
+ViGEmBus comes back — log line `virtual gamepad ready for AA:BB:…
+(recovered after retry)` confirms the recovery.
+
+If the retry never succeeds: reinstall ViGEmBus from the
+[releases page](https://github.com/nefarius/ViGEmBus/releases) and
+reboot. If you have **HidHide** installed, check that it isn't hiding
+the Wiimote's raw HID — that confuses ViGEm's plug routine.
 
 ### Reports stalling for ~1 s
 
