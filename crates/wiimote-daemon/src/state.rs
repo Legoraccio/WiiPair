@@ -116,6 +116,11 @@ pub struct DeviceRuntime {
     /// When `Some(t)`, the rumble motor must be turned off at `t`
     /// (end of an Identify pulse).
     pub rumble_off_at: Option<Instant>,
+    /// When `output` couldn't be created at promote time (ViGEmBus in
+    /// a transient state, uinput permissions race, …) the daemon
+    /// retries periodically. `Some(t)` is the next attempt time;
+    /// cleared once `output` is populated successfully.
+    pub output_retry_at: Option<Instant>,
 }
 
 impl DeviceRuntime {
@@ -133,6 +138,7 @@ impl DeviceRuntime {
             last_gap_log: None,
             slot: None,
             rumble_off_at: None,
+            output_retry_at: None,
         }
     }
 
@@ -155,6 +161,7 @@ impl DeviceRuntime {
         self.last_gap_log = None;
         self.slot = None;
         self.rumble_off_at = None;
+        self.output_retry_at = None;
     }
 }
 

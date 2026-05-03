@@ -67,6 +67,10 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 const REPORT_GAP_WARN_MS: u128 = 80;
 /// Minimum spacing between report-gap log lines per device.
 const GAP_LOG_BACKOFF: Duration = Duration::from_millis(800);
+/// How long to wait between successive `output_for_profile` retries
+/// when ViGEmBus / uinput is transiently unavailable. Three seconds
+/// covers ViGEmBus' driver-restart time without flooding the log.
+const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 
 // =====================================================================
 // Public types
@@ -301,6 +305,7 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
         tick_pair_stuck(now, &mut ctx, &events_tx);
         tick_rumble_off(now, &mut ctx, &mut hid);
         tick_manual_scan_window(now, &mut ctx, &events_tx);
+        tick_output_retry(now, &mut ctx, &events_tx);
 
         // 5) Pause active BT inquiry while controllers are connected and
         // the user isn't explicitly asking to find new ones.
@@ -392,11 +397,13 @@ fn handle_set_profile(
     // (or the inline rebuild below) creates one with the new mapping.
     let was_connected = r.snapshot.connected;
     r.output = None;
+    r.output_retry_at = None;
     if was_connected {
         match output_for_profile(profile) {
             Ok(out) => {
                 if let Some(r) = ctx.registry.get_mut(&id) {
                     r.output = Some(out);
+                    r.snapshot.last_error = None;
                 }
             }
             Err(e) => {
@@ -404,6 +411,7 @@ fn handle_set_profile(
                 if let Some(r) = ctx.registry.get_mut(&id) {
                     r.snapshot.last_error =
                         Some("Could not rebuild virtual gamepad with new profile".into());
+                    r.output_retry_at = Some(Instant::now() + OUTPUT_RETRY_INTERVAL);
                 }
             }
         }
@@ -997,8 +1005,55 @@ fn promote_to_connected(
             };
             if let Some(r) = ctx.registry.get_mut(id) {
                 r.snapshot.last_error = Some(user_msg.into());
+                // Don't give up — ViGEmBus often comes back within a
+                // few seconds (driver restart, transient state on
+                // first ever connect). The retry tick clears the
+                // error once it succeeds.
+                r.output_retry_at = Some(Instant::now() + OUTPUT_RETRY_INTERVAL);
             }
             let _ = events_tx.send(log_event(LogLevel::Warn, user_msg));
+        }
+    }
+}
+
+/// Periodically retry `output_for_profile` for devices that are
+/// connected but couldn't get a virtual gamepad target the first
+/// time. Clears `last_error` and emits a recovery log line on
+/// success, otherwise schedules the next attempt.
+fn tick_output_retry(now: Instant, ctx: &mut DaemonCtx, events_tx: &Sender<UiEvent>) {
+    let due: Vec<(String, MappingProfile)> = ctx
+        .registry
+        .iter()
+        .filter(|(_, r)| {
+            r.snapshot.connected
+                && r.output.is_none()
+                && r.output_retry_at.is_some_and(|t| t <= now)
+        })
+        .map(|(id, r)| (id.clone(), r.snapshot.mapping_profile))
+        .collect();
+    for (id, profile) in due {
+        match output_for_profile(profile) {
+            Ok(out) => {
+                if let Some(r) = ctx.registry.get_mut(&id) {
+                    r.output = Some(out);
+                    r.output_retry_at = None;
+                    r.snapshot.last_error = None;
+                    ctx.dirty = true;
+                }
+                let _ = events_tx.send(log_event(
+                    LogLevel::Info,
+                    format!(
+                        "virtual gamepad ready for {} (recovered after retry)",
+                        short_id(&id)
+                    ),
+                ));
+            }
+            Err(e) => {
+                debug!("output retry for {id} failed: {e}");
+                if let Some(r) = ctx.registry.get_mut(&id) {
+                    r.output_retry_at = Some(now + OUTPUT_RETRY_INTERVAL);
+                }
+            }
         }
     }
 }
