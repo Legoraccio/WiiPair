@@ -104,6 +104,14 @@ jobs:
           cp README.md LICENSE "$STAGE/"
           mkdir -p "$STAGE/docs/udev"
           cp docs/udev/99-wiipair.rules "$STAGE/docs/udev/"
+          # Desktop integration: ship the icon source PNG and the
+          # .desktop file so users can wire WiiPair into their app
+          # menu. Installation is documented in the README.
+          if [ -f assets/icon.png ]; then
+            mkdir -p "$STAGE/docs/desktop"
+            cp assets/icon.png "$STAGE/docs/desktop/wiipair.png"
+            cp docs/desktop/wiipair.desktop "$STAGE/docs/desktop/"
+          fi
           tar -czf "${STAGE}.tar.gz" "$STAGE"
 
       - uses: actions/upload-artifact@v4

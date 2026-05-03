@@ -6,6 +6,7 @@
 
 mod device_card;
 mod dialogs;
+mod icon;
 mod icons;
 mod widgets;
 
@@ -34,11 +35,15 @@ fn main() -> eframe::Result {
     // below ~820x540 without overlapping each other. The previous
     // 640x420 minimum let the user shrink the window to a state where
     // widgets clipped through one another.
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([960.0, 640.0])
+        .with_min_inner_size([820.0, 540.0])
+        .with_title("WiiPair");
+    if let Some(icon) = icon::load() {
+        viewport = viewport.with_icon(icon);
+    }
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([960.0, 640.0])
-            .with_min_inner_size([820.0, 540.0])
-            .with_title("WiiPair"),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(

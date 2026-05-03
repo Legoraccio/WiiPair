@@ -3,6 +3,7 @@ name = "wiipair-ui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+build = "build.rs"
 
 [[bin]]
 name = "wiipair"
@@ -17,3 +18,15 @@ egui = "0.29"
 crossbeam-channel = { workspace = true }
 tracing-subscriber = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Decode the PNG icon at runtime for `with_icon`. We deliberately keep
+# only PNG decoding to avoid pulling in jpeg/webp/etc.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[build-dependencies]
+# Generate `icon.ico` in OUT_DIR from `assets/icon.png` so the
+# Windows-only winresource step has a multi-size icon to embed.
+image = { version = "0.25", default-features = false, features = ["png"] }
+ico = "0.4"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

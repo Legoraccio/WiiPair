@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=WiiPair
+GenericName=Wii Controller Bridge
+Comment=Bridge Bluetooth Wii controllers to a virtual Xbox 360 pad
+Exec=wiipair
+Icon=wiipair
+Terminal=false
+Categories=Utility;Game;HardwareSettings;
+Keywords=wiimote;wii;bluetooth;gamepad;xbox;
+StartupNotify=true

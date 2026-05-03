@@ -1,5 +1,7 @@
 # WiiPair
 
+![WiiPair — a Wiimote-shaped monolith on a moonscape, surrounded by curious primates with Wii instruments and a pile of controllers](assets/banner.png)
+
 > ⚠️ **Beta software.** WiiPair handles low-level Bluetooth and virtual-driver
 > plumbing on three operating systems. Some BT chipsets and OS combinations
 > still produce edge-case behaviour we haven't seen yet — see
@@ -113,7 +115,20 @@ of glibc version mismatches — build from source instead.
 3. Log out and back in (so the new `input` group sticks), then run
    `./wiipair`. If you forget the udev rule the app pops a dialog
    at startup explaining how to fix it.
-4. If you have the kernel `hid-wiimote` driver loaded
+4. *(Optional)* Install the desktop entry so WiiPair shows up in your
+   application menu with its icon:
+   ```sh
+   sudo install -Dm644 docs/desktop/wiipair.png \
+     /usr/share/icons/hicolor/512x512/apps/wiipair.png
+   sudo install -Dm644 docs/desktop/wiipair.desktop \
+     /usr/share/applications/wiipair.desktop
+   sudo install -m755 wiipair /usr/local/bin/wiipair
+   sudo gtk-update-icon-cache /usr/share/icons/hicolor || true
+   ```
+   The `.desktop` entry expects `wiipair` to be on `$PATH`; the third
+   line above copies the binary into `/usr/local/bin/`. Edit `Exec=`
+   in the `.desktop` file if you'd rather keep the binary elsewhere.
+5. If you have the kernel `hid-wiimote` driver loaded
    (`lsmod | grep wiimote`), blacklist it so the kernel doesn't claim
    paired Wiimotes before WiiPair sees them:
    ```sh
