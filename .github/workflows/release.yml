@@ -62,6 +62,11 @@ jobs:
   build-linux:
     needs: validate
     runs-on: ubuntu-22.04
+    env:
+      # mold cuts ~1-2 minutes off the link phase of a cold release
+      # build. Clang drives the link so the -fuse-ld=mold flag is
+      # forwarded properly through rustc.
+      RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v4
 
@@ -75,7 +80,9 @@ jobs:
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
             libgl1-mesa-dev \
-            libssl-dev
+            libssl-dev \
+            clang \
+            mold
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -85,7 +92,7 @@ jobs:
           shared-key: release-linux
 
       - name: Build release
-        run: cargo build --release -p wiipair-ui
+        run: cargo build --profile release-dist --locked -p wiipair-ui
 
       - name: Stage artifact
         run: |
@@ -93,7 +100,7 @@ jobs:
           VERSION="${{ needs.validate.outputs.version }}"
           STAGE="wiipair-${VERSION}-x86_64-linux"
           mkdir -p "$STAGE"
-          cp target/release/wiipair "$STAGE/"
+          cp target/release-dist/wiipair "$STAGE/"
           cp README.md LICENSE "$STAGE/"
           mkdir -p "$STAGE/docs/udev"
           cp docs/udev/99-wiipair.rules "$STAGE/docs/udev/"
@@ -124,7 +131,7 @@ jobs:
           shared-key: release-windows
 
       - name: Build release
-        run: cargo build --release -p wiipair-ui
+        run: cargo build --profile release-dist --locked -p wiipair-ui
 
       - name: Stage artifact
         shell: pwsh
@@ -132,7 +139,7 @@ jobs:
           $version = "${{ needs.validate.outputs.version }}"
           $stage = "wiipair-$version-x86_64-windows"
           New-Item -ItemType Directory -Path $stage | Out-Null
-          Copy-Item target/release/wiipair.exe $stage/
+          Copy-Item target/release-dist/wiipair.exe $stage/
           Copy-Item README.md $stage/
           Copy-Item LICENSE $stage/
           Compress-Archive -Path "$stage/*" -DestinationPath "$stage.zip"

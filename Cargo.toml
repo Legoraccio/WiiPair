@@ -26,3 +26,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Profile used by the GitHub Release pipeline. Strips debug/symbol
+# tables to keep the published binary small (~30-40% smaller than the
+# bare release profile) without changing the runtime characteristics
+# of `cargo build --release` developers use locally.
+[profile.release-dist]
+inherits = "release"
+strip = "symbols"
