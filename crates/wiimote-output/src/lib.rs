@@ -37,6 +37,65 @@ pub fn default_output() -> anyhow::Result<Box<dyn Output>> {
     output_for_profile(MappingProfile::Auto)
 }
 
+/// Cheap smoke test for the platform output backend, run by the UI at
+/// startup so the user gets a clear "install ViGEmBus" dialog *before*
+/// they pair their first Wiimote — instead of finding out only when
+/// the virtual pad fails to appear in their game.
+///
+/// * Windows: tries to open a ViGEmBus client connection and drops it
+///   immediately. Fails when the driver isn't installed or the
+///   service isn't running.
+/// * Linux: checks that `/dev/uinput` is writable.
+/// * macOS: always Ok — the CGEvent backend has no install-time
+///   prerequisite (Accessibility permission is requested lazily).
+pub fn probe_default() -> Result<(), ProbeFailure> {
+    #[cfg(windows)]
+    {
+        return match vigem_client::Client::connect() {
+            Ok(_) => Ok(()),
+            Err(e) => Err(ProbeFailure {
+                kind: ProbeKind::ViGEmBusMissing,
+                detail: format!("{e}"),
+            }),
+        };
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return match std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/uinput")
+        {
+            Ok(_) => Ok(()),
+            Err(e) => Err(ProbeFailure {
+                kind: ProbeKind::UinputUnavailable,
+                detail: format!("{e}"),
+            }),
+        };
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        Ok(())
+    }
+}
+
+/// Why the platform output backend isn't ready. The kind drives the
+/// UI's "how do I fix this?" dialog; `detail` is the raw error string
+/// for the log.
+#[derive(Debug, Clone)]
+pub struct ProbeFailure {
+    pub kind: ProbeKind,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeKind {
+    /// Windows: ViGEmBus driver not installed / service stopped.
+    ViGEmBusMissing,
+    /// Linux: /dev/uinput not writable (missing udev rule, user not
+    /// in the `input` group, or kernel without the uinput module).
+    UinputUnavailable,
+}
+
 /// Build the platform output backend with a specific mapping profile.
 /// On Windows that profile drives ViGEm; on Linux it drives uinput;
 /// on macOS the keyboard-mapping profiles select the CGEvent fallback

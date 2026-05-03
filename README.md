@@ -67,6 +67,65 @@ modern macOS requires a signed DriverKit driver, which isn't realistic
 for an open-source project. The keyboard-mapping profiles cover Clone
 Hero and most browser games out of the box.
 
+## Install (pre-built binaries)
+
+Each tagged release publishes ready-to-run archives on the GitHub
+[Releases page](https://github.com/Legoraccio/WiiPair/releases). Pick
+the one for your platform.
+
+### Windows
+
+1. Install the **ViGEmBus** driver from the
+   [ViGEmBus releases page](https://github.com/nefarius/ViGEmBus/releases)
+   (`ViGEmBus_Setup_*_x64.msi`). Reboot. Without it WiiPair can still
+   read the Wiimote but no game will see a virtual XInput pad — and
+   the app will pop a dialog at startup linking you back to the
+   download page.
+2. Download `wiipair-vX.Y.Z-x86_64-windows.zip` from the WiiPair
+   releases page and extract anywhere (e.g. `C:\Tools\WiiPair\`).
+3. Double-click `wiipair.exe`. SmartScreen will warn that the
+   publisher is unknown the first time — choose *More info → Run
+   anyway*. The binary is unsigned because Authenticode certificates
+   are paid; the source is open and the workflow that built the
+   release is in `.github/workflows/release.yml`.
+
+### Linux
+
+Tested on Ubuntu 22.04+, Debian 12+, Mint 21+, Bluefin / Silverblue
+F38+. On older distros the bundled binary may fail to start because
+of glibc version mismatches — build from source instead.
+
+1. Install the runtime libraries:
+   ```sh
+   sudo apt install libdbus-1-3 libudev1 libxkbcommon0 libxkbcommon-x11-0 libgl1
+   ```
+   (On Fedora/Bluefin/Silverblue derivatives the equivalent packages
+   are usually preinstalled with the desktop environment.)
+2. Download `wiipair-vX.Y.Z-x86_64-linux.tar.gz`, extract, and install
+   the udev rule shipped in the bundle:
+   ```sh
+   tar xzf wiipair-*-x86_64-linux.tar.gz
+   cd wiipair-*-x86_64-linux
+   sudo cp docs/udev/99-wiipair.rules /etc/udev/rules.d/
+   sudo udevadm control --reload && sudo udevadm trigger
+   sudo usermod -aG input "$USER"
+   ```
+3. Log out and back in (so the new `input` group sticks), then run
+   `./wiipair`. If you forget the udev rule the app pops a dialog
+   at startup explaining how to fix it.
+4. If you have the kernel `hid-wiimote` driver loaded
+   (`lsmod | grep wiimote`), blacklist it so the kernel doesn't claim
+   paired Wiimotes before WiiPair sees them:
+   ```sh
+   echo blacklist hid-wiimote | sudo tee /etc/modprobe.d/wiipair.conf
+   sudo reboot
+   ```
+
+### macOS
+
+> **Status:** keyboard-mapping output only. No pre-built bundles for
+> macOS yet — build from source as documented below.
+
 ## Build
 
 ### All platforms

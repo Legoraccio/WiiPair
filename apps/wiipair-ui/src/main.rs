@@ -13,6 +13,7 @@ use chrono::{DateTime, Local};
 use eframe::egui;
 use std::collections::VecDeque;
 use wiimote_daemon::{Daemon, DeviceSnapshot, LogLevel, UiCommand, UiEvent};
+use wiimote_output::{ProbeFailure, probe_default};
 
 fn main() -> eframe::Result {
     tracing_subscriber::fmt()
@@ -23,6 +24,11 @@ fn main() -> eframe::Result {
         .init();
 
     let daemon = Daemon::start().expect("daemon failed to start");
+    // Probe the platform output backend before showing the UI so a
+    // missing ViGEmBus / unwritable /dev/uinput surfaces as a dedicated
+    // dialog at startup instead of a cryptic per-row error after the
+    // first Wiimote connects.
+    let driver_probe = probe_default().err();
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([900.0, 600.0])
@@ -33,7 +39,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "WiiPair",
         opts,
-        Box::new(move |_cc| Ok(Box::new(App::new(daemon)))),
+        Box::new(move |_cc| Ok(Box::new(App::new(daemon, driver_probe)))),
     )
 }
 
@@ -89,10 +95,15 @@ struct App {
     /// disabled" / "ViGEmBus unavailable" so the user notices even
     /// after the original log line has scrolled off (U12).
     persistent_warnings: Vec<String>,
+    /// Set at startup by `probe_default()` when the platform output
+    /// backend isn't ready; cleared once the user dismisses the
+    /// install-driver dialog.
+    driver_probe: Option<ProbeFailure>,
+    driver_dialog_dismissed: bool,
 }
 
 impl App {
-    fn new(daemon: Daemon) -> Self {
+    fn new(daemon: Daemon, driver_probe: Option<ProbeFailure>) -> Self {
         let (card_tx, card_rx) = crossbeam_channel::unbounded();
         Self {
             daemon,
@@ -105,6 +116,8 @@ impl App {
             card_tx,
             card_rx,
             persistent_warnings: Vec::new(),
+            driver_probe,
+            driver_dialog_dismissed: false,
         }
     }
 
@@ -318,6 +331,17 @@ impl App {
     }
 
     fn render_modals(&mut self, ctx: &egui::Context) {
+        // Driver-missing dialog (ViGEmBus / uinput). Shown once at
+        // startup; dismissing it sets a sticky flag so it doesn't
+        // re-pop on every frame.
+        if let Some(failure) = &self.driver_probe {
+            if !self.driver_dialog_dismissed
+                && dialogs::driver_missing_dialog(ctx, failure)
+            {
+                self.driver_dialog_dismissed = true;
+            }
+        }
+
         // Pairing-stuck recovery dialog.
         if let Some(addr) = self.pairing_stuck {
             if dialogs::pairing_stuck_dialog(ctx, addr) {
