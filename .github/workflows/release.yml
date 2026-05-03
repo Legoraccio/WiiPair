@@ -23,31 +23,23 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------
-  # Sanity check: the tag version must match the workspace version in
-  # Cargo.toml so we never publish a release with a misleading number.
+  # Pull the version out of the tag — it's the source of truth, both
+  # build jobs rewrite [workspace.package].version in Cargo.toml to
+  # match before they compile so the binary's reported version always
+  # tracks the published tag without requiring a manual bump commit.
   # ---------------------------------------------------------------------
   validate:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
       - id: v
         shell: bash
         run: |
           set -euo pipefail
           TAG_VER="${GITHUB_REF#refs/tags/v}"
-          MANIFEST_VER=$(awk -F'"' '
-            /^\[workspace\.package\]/ {f=1; next}
-            /^\[/ {f=0}
-            f && /^version[[:space:]]*=/ {print $2; exit}
-          ' Cargo.toml)
-          if [ -z "$MANIFEST_VER" ]; then
-            echo "::error::Could not read [workspace.package].version from Cargo.toml"
-            exit 1
-          fi
-          if [ "$TAG_VER" != "$MANIFEST_VER" ]; then
-            echo "::error::Tag v$TAG_VER doesn't match Cargo.toml version $MANIFEST_VER"
+          if [ -z "$TAG_VER" ]; then
+            echo "::error::Tag does not look like vX.Y.Z (got $GITHUB_REF)"
             exit 1
           fi
           echo "version=$TAG_VER" >> "$GITHUB_OUTPUT"
@@ -91,8 +83,32 @@ jobs:
         with:
           shared-key: release-linux
 
+      - name: Sync workspace version with tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${{ needs.validate.outputs.version }}"
+          # Only rewrite the `version = "..."` line that lives under
+          # [workspace.package] — every member crate inherits via
+          # version.workspace = true.
+          awk -v ver="$VER" '
+            /^\[workspace\.package\]/ { in_block=1; print; next }
+            in_block && /^version[[:space:]]*=/ {
+              print "version = \"" ver "\""
+              in_block=0
+              next
+            }
+            /^\[/ { in_block=0 }
+            { print }
+          ' Cargo.toml > Cargo.toml.new
+          mv Cargo.toml.new Cargo.toml
+          # Re-resolve only the workspace members in Cargo.lock so the
+          # bumped version doesn't desync from the lock. External deps
+          # stay pinned to their pre-tag versions.
+          cargo update --workspace --quiet
+
       - name: Build release
-        run: cargo build --profile release-dist --locked -p wiipair-ui
+        run: cargo build --profile release-dist -p wiipair-ui
 
       - name: Stage artifact
         run: |
@@ -138,8 +154,26 @@ jobs:
         with:
           shared-key: release-windows
 
+      - name: Sync workspace version with tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${{ needs.validate.outputs.version }}"
+          awk -v ver="$VER" '
+            /^\[workspace\.package\]/ { in_block=1; print; next }
+            in_block && /^version[[:space:]]*=/ {
+              print "version = \"" ver "\""
+              in_block=0
+              next
+            }
+            /^\[/ { in_block=0 }
+            { print }
+          ' Cargo.toml > Cargo.toml.new
+          mv Cargo.toml.new Cargo.toml
+          cargo update --workspace --quiet
+
       - name: Build release
-        run: cargo build --profile release-dist --locked -p wiipair-ui
+        run: cargo build --profile release-dist -p wiipair-ui
 
       - name: Stage artifact
         shell: pwsh
