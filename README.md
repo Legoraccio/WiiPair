@@ -2,440 +2,256 @@
 
 ![WiiPair — a Wiimote-shaped monolith on a moonscape, surrounded by curious primates with Wii instruments and a pile of controllers](assets/banner.jpg)
 
-> ⚠️ **Beta software.** WiiPair handles low-level Bluetooth and virtual-driver
-> plumbing on three operating systems. Some BT chipsets and OS combinations
-> still produce edge-case behaviour we haven't seen yet — see
-> [Troubleshooting](#troubleshooting). Bug reports with the in-app log
-> attached are very welcome.
+Bridges Bluetooth Wii controllers (Wiimote, Nunchuk, Classic, GH/RB guitar/drums)
+to virtual Xbox 360 pads on the desktop, so games like Clone Hero, Steam, or
+anything that speaks XInput see them as standard controllers — no emulator
+required.
 
-Bridges Bluetooth Wii controllers to virtual Xbox 360 pads on the desktop, so
-that games like Clone Hero, Steam, or anything that speaks XInput see them as
-standard controllers — no emulator required.
-
-The original motivation: play Clone Hero with a Guitar Hero / Rock Band Wii
-guitar.
+> ⚠️ **Beta.** Bluetooth chipset and OS combinations still surface edge cases.
+> Bug reports with the in-app log attached are welcome — see
+> [Troubleshooting](#troubleshooting).
 
 ## Features
 
-- **Auto-pair** for Wiimotes via the legacy 1+2 PIN trick — no manual OS
-  pairing dance.
+- **Auto-pair** Wiimotes via the legacy 1+2 PIN trick — no manual OS pairing.
 - **Auto-(re)connect** on power-on, auto-disconnect on power-off, with a 2 s
-  inactivity watchdog that catches Wiimotes going silent.
-- **Up to 4 controllers** simultaneously, each assigned its own player LED
-  and XInput slot.
-- **Switchable mapping profiles** per device — Auto / Wiimote ↔ Xbox /
-  Guitar ↔ Xplorer / Drums ↔ Xplorer / Classic ↔ Xbox, plus keyboard
-  fallbacks (Wiimote ↔ Keyboard / Guitar ↔ Keyboard) for macOS or for
-  games that don't speak XInput.
-- **Identify pulse**: a 0.6 s rumble + LED blink to tell which physical
-  Wiimote a row in the UI corresponds to.
-- **Forget** removes the device from WiiPair *and* unpairs it from the OS
-  Bluetooth registry, so it doesn't auto-rejoin on the next inquiry.
-- **Persistent device list** — known Wiimotes appear as offline
-  placeholders across restarts, with the right extension icon, and
-  reconnect themselves the moment they power on.
-- **Per-extension UI panels** showing live button state — frets, strum,
-  whammy bar, drum pads, classic-pad layout, Nunchuk stick, plus tilt
-  disc, IR-dot canvas and battery percentage.
-- **Filterable log** with timestamps stamped at the moment of the event
-  (not at UI read time), and a persistent banner for stack-level errors
-  (ViGEmBus missing, BT scanner disabled, …).
+  inactivity watchdog.
+- **Up to 4 controllers** simultaneously, each with its own player LED and
+  XInput slot.
+- **Switchable mapping profiles** per device — Wiimote/Guitar/Drums/Classic
+  → Xbox / Xplorer, plus keyboard fallbacks for macOS.
+- **Identify pulse** — 0.6 s rumble + LED blink to match a UI row to a
+  physical Wiimote.
+- **Forget** removes the device from WiiPair *and* unpairs it from the OS.
+- **Persistent device list** — known Wiimotes appear as offline placeholders
+  across restarts and reconnect when powered on.
+- **Live per-extension UI** — frets, strum, whammy, drum pads, classic-pad,
+  Nunchuk stick, tilt disc, IR-dot canvas, battery.
+- **Filterable log** with persistent banner for stack-level errors.
 
-## Supported devices
+## Compatibility
 
 | Device                                  | Status     | Notes                                                    |
 | --------------------------------------- | ---------- | -------------------------------------------------------- |
 | Wii Remote (`RVL-CNT-01`)               | ✅ Full    | Buttons, accelerometer, IR camera (extended).            |
-| Wii Remote Plus (`RVL-CNT-01-TR`)       | ✅ Full    | Same as Wii Remote. See [Troubleshooting](#troubleshooting) — Windows often needs the device unpaired before each session. |
+| Wii Remote Plus (`RVL-CNT-01-TR`)       | ✅ Full    | Same as Wii Remote. Has Windows-side quirks — see [Troubleshooting](#troubleshooting). |
 | Nunchuk                                 | ✅ Full    | Analog stick, C, Z, accelerometer.                       |
 | Classic Controller / Pro                | ✅ Full    | Full pad layout (A/B/X/Y, ZL/ZR, L/R, +/−, Home, D-pad). |
-| Guitar Hero / Rock Band guitar (Wii)    | ✅ Full    | 5 frets, strum ↑/↓, whammy bar, +/−. Xplorer-compatible. |
-| Guitar Hero / Rock Band drums (Wii)     | ✅ Full    | 5 pads + bass pedal + +/−.                               |
-| DJ Hero turntable                       | ⚠️ ID only | Identified, no data parsing yet.                         |
-| Wii Motion Plus                         | ⚠️ ID only | Identified, no gyro parsing yet.                         |
+| GH / RB guitar (Wii)                    | ✅ Full    | 5 frets, strum ↑/↓, whammy, +/−. Xplorer-compatible.     |
+| GH / RB drums (Wii)                     | ✅ Full    | 5 pads + bass pedal + +/−.                               |
+| DJ Hero turntable, Wii Motion Plus      | ⚠️ ID only | Identified, no data parsing yet.                         |
 | uDraw Tablet, Taiko TaTaCon             | ⚠️ ID only | Identified by extension ID.                              |
 | Wii Balance Board                       | ❌         | Separate Bluetooth device (not an extension).            |
 
-## Platform support
+| OS                  | Status                                                                  |
+| ------------------- | ----------------------------------------------------------------------- |
+| **Windows 10 / 11** | ✅ Full — BT scan, auto-pair (Win32 BluetoothAPIs), ViGEm output.       |
+| **Linux**           | ✅ Full — BlueZ DBus auto-pair, uinput Xbox 360 output.                 |
+| **macOS**           | ⚠️ Partial — manual pairing via System Settings; CGEvent keyboard only. |
 
-| OS                  | Status                                                                     |
-| ------------------- | -------------------------------------------------------------------------- |
-| **Windows 10 / 11** | ✅ Full — BT scan, auto-pair (Win32 `BluetoothAPIs`), ViGEm output.        |
-| **Linux**           | ✅ Full — BlueZ DBus scanner + auto-pair + `uinput` Xbox 360 output.       |
-| **macOS**           | ⚠️ Partial — manual pairing via System Settings; CGEvent keyboard output. |
-
-macOS is keyboard-only because publishing a real virtual XInput pad on
-modern macOS requires a signed DriverKit driver, which isn't realistic
-for an open-source project. The keyboard-mapping profiles cover Clone
+macOS is keyboard-only because publishing a virtual XInput pad on modern
+macOS requires a signed DriverKit driver. The keyboard profiles cover Clone
 Hero and most browser games out of the box.
 
-## Install (pre-built binaries)
+## Install
 
-Each tagged release publishes ready-to-run archives on the GitHub
-[Releases page](https://github.com/Legoraccio/WiiPair/releases). Pick
-the one for your platform.
+Pre-built archives for tagged releases live on the
+[Releases page](https://github.com/Legoraccio/WiiPair/releases).
 
 ### Windows
 
-1. Install the **ViGEmBus** driver from the
-   [ViGEmBus releases page](https://github.com/nefarius/ViGEmBus/releases)
-   (`ViGEmBus_Setup_*_x64.msi`). Reboot. Without it WiiPair can still
-   read the Wiimote but no game will see a virtual XInput pad — and
-   the app will pop a dialog at startup linking you back to the
-   download page.
-2. Download `wiipair-vX.Y.Z-x86_64-windows.zip` from the WiiPair
-   releases page and extract anywhere (e.g. `C:\Tools\WiiPair\`).
-3. Double-click `wiipair.exe`. SmartScreen will warn that the
-   publisher is unknown the first time — choose *More info → Run
-   anyway*. The binary is unsigned because Authenticode certificates
-   are paid; the source is open and the workflow that built the
-   release is in `.github/workflows/release.yml`.
+1. Install **ViGEmBus** from the
+   [ViGEmBus releases](https://github.com/nefarius/ViGEmBus/releases)
+   (`ViGEmBus_Setup_*_x64.msi`) and reboot. Without it WiiPair can read
+   the Wiimote but games won't see a virtual pad.
+2. Download `wiipair-vX.Y.Z-x86_64-windows.zip`, extract, run `wiipair.exe`.
+   SmartScreen will warn the publisher is unknown the first time
+   (Authenticode certificates are paid; the source and release workflow
+   are open).
 
 ### Linux
 
-Tested on Ubuntu 22.04+, Debian 12+, Mint 21+, Bluefin / Silverblue
-F38+. On older distros the bundled binary may fail to start because
-of glibc version mismatches — build from source instead.
+Tested on Ubuntu 22.04+, Debian 12+, Mint 21+, Bluefin/Silverblue F38+.
+On older distros, build from source (glibc mismatches).
 
-1. Install the runtime libraries:
+1. Install runtime libraries (Debian/Ubuntu):
    ```sh
    sudo apt install libdbus-1-3 libudev1 libxkbcommon0 libxkbcommon-x11-0 libgl1
    ```
-   (On Fedora/Bluefin/Silverblue derivatives the equivalent packages
-   are usually preinstalled with the desktop environment.)
-2. Download `wiipair-vX.Y.Z-x86_64-linux.tar.gz`, extract, and install
-   the udev rule shipped in the bundle:
+2. Download `wiipair-vX.Y.Z-x86_64-linux.tar.gz`, extract, install the
+   bundled udev rule and add yourself to the `input` group:
    ```sh
-   tar xzf wiipair-*-x86_64-linux.tar.gz
-   cd wiipair-*-x86_64-linux
    sudo cp docs/udev/99-wiipair.rules /etc/udev/rules.d/
    sudo udevadm control --reload && sudo udevadm trigger
    sudo usermod -aG input "$USER"
    ```
-3. Log out and back in (so the new `input` group sticks), then run
-   `./wiipair`. If you forget the udev rule the app pops a dialog
-   at startup explaining how to fix it.
-4. *(Optional)* Install the desktop entry so WiiPair shows up in your
-   application menu with its icon:
-   ```sh
-   sudo install -Dm644 docs/desktop/wiipair.png \
-     /usr/share/icons/hicolor/512x512/apps/wiipair.png
-   sudo install -Dm644 docs/desktop/wiipair.desktop \
-     /usr/share/applications/wiipair.desktop
-   sudo install -m755 wiipair /usr/local/bin/wiipair
-   sudo gtk-update-icon-cache /usr/share/icons/hicolor || true
-   ```
-   The `.desktop` entry expects `wiipair` to be on `$PATH`; the third
-   line above copies the binary into `/usr/local/bin/`. Edit `Exec=`
-   in the `.desktop` file if you'd rather keep the binary elsewhere.
-5. If you have the kernel `hid-wiimote` driver loaded
-   (`lsmod | grep wiimote`), blacklist it so the kernel doesn't claim
-   paired Wiimotes before WiiPair sees them:
+   Log out and back in so the group sticks, then run `./wiipair`.
+3. If `lsmod | grep wiimote` shows `hid-wiimote` is loaded, blacklist it
+   so the kernel doesn't claim Wiimotes before WiiPair sees them:
    ```sh
    echo blacklist hid-wiimote | sudo tee /etc/modprobe.d/wiipair.conf
    sudo reboot
    ```
+4. *(Optional)* Desktop integration — install icon, `.desktop` entry, and
+   the binary to `$PATH`:
+   ```sh
+   sudo install -Dm644 assets/icon.png /usr/share/icons/hicolor/512x512/apps/wiipair.png
+   sudo install -Dm644 docs/desktop/wiipair.desktop /usr/share/applications/
+   sudo install -m755 wiipair /usr/local/bin/
+   sudo gtk-update-icon-cache /usr/share/icons/hicolor || true
+   ```
 
 ### macOS
 
-> **Status:** keyboard-mapping output only. No pre-built bundles for
-> macOS yet — build from source as documented below.
+No pre-built bundle yet — build from source (below). Pairing goes through
+*System Settings → Bluetooth*; output is keyboard-only via CGEvent.
 
-## Build
+## Build from source
 
-### All platforms
-
-Install the Rust toolchain (stable, 1.80 or later) from
-[rustup.rs](https://rustup.rs).
-
-### Windows
-
-Prerequisites:
-
-- A Bluetooth radio (built-in laptop BT, or a USB BT 2.1+ EDR dongle —
-  CSR/Broadcom chips work most reliably with the Wiimote).
-- The **ViGEmBus** driver. Download `ViGEmBus_Setup_*_x64.msi` from the
-  [ViGEmBus releases page](https://github.com/nefarius/ViGEmBus/releases),
-  install it, and reboot. Without it, WiiPair can still read the Wiimote
-  but won't expose a virtual XInput pad to games.
-
-Build and run:
-
-```sh
-cargo run -p wiipair-ui
-```
-
-Release build (single-binary in `target/release/wiipair.exe`):
+Install the Rust toolchain (stable, 1.80+) from [rustup.rs](https://rustup.rs).
 
 ```sh
 cargo build --release -p wiipair-ui
 ```
 
-To verify ViGEmBus is healthy: connect a Wiimote in WiiPair, then open
-`joy.cpl` (Run → `joy.cpl`). You should see both:
-
-- "Nintendo RVL-CNT-01" — the Wiimote as raw HID
-- "Controller (XBOX 360 For Windows)" — the virtual ViGEm pad WiiPair created
-
-If only the first one appears, ViGEmBus isn't producing the virtual pad —
-reinstall it, or check for HidHide/HidGuardian conflicts.
-
-### Linux
-
-Install build dependencies (Debian/Ubuntu):
-
+**Linux** also needs build deps:
 ```sh
 sudo apt install pkg-config libudev-dev libxkbcommon-dev libxkbcommon-x11-dev \
     libgl1-mesa-dev libssl-dev libdbus-1-dev
 ```
+Then install the udev rule and (if loaded) blacklist `hid-wiimote` as in
+[Install → Linux](#linux) above.
 
-Build:
+**Windows** also needs the ViGEmBus driver — see
+[Install → Windows](#windows). To verify it's healthy, connect a Wiimote in
+WiiPair and open `joy.cpl`; you should see both *Nintendo RVL-CNT-01* (raw
+HID) and *Controller (XBOX 360 For Windows)* (the virtual ViGEm pad). If
+only the first appears, reinstall ViGEmBus and check for HidHide conflicts.
 
-```sh
-cargo build --release -p wiipair-ui
-```
+**macOS** needs Accessibility permission for keyboard injection: *System
+Settings → Privacy & Security → Accessibility* → toggle WiiPair on. The
+default keymap (Wiimote → Keyboard profile) targets Clone Hero / browser
+games:
 
-Install the udev rule so your user can write to `/dev/uinput` (needed for
-the virtual Xbox 360 pad) and read `/dev/hidraw*` for paired Wiimotes:
-
-```sh
-sudo cp docs/udev/99-wiipair.rules /etc/udev/rules.d/
-sudo udevadm control --reload && sudo udevadm trigger
-sudo usermod -aG input "$USER"   # then log out and back in
-```
-
-Conflict with the kernel's `hid-wiimote` driver: the kernel claims paired
-Wiimotes and exposes them as a synthetic keyboard/mouse, which conflicts
-with us reading via hidapi. Either blacklist the module
-(`echo blacklist hid-wiimote | sudo tee /etc/modprobe.d/wiipair.conf` then
-reboot) or unbind individual devices from `/sys/bus/hid/drivers/wiimote/unbind`
-after they pair.
-
-Run:
-
-```sh
-./target/release/wiipair
-```
-
-### macOS
-
-Build:
-
-```sh
-cargo build --release -p wiipair-ui
-```
-
-Pair the Wiimote manually via *System Settings → Bluetooth*: press 1+2 on
-the Wiimote to make it discoverable, then click "Connect" next to the
-"Nintendo RVL-CNT-01" entry. Once paired the WiiPair UI picks it up via
-hidapi.
-
-macOS output is **keyboard-only** (synthesised via Quartz CGEvent) — the
-device card defaults to `Wiimote → Keyboard`. To enable keyboard injection,
-allow the WiiPair binary under *System Settings → Privacy & Security →
-Accessibility*. The default keymap targets Clone Hero / browser games:
-
-| Wiimote button | Key       |
-| -------------- | --------- |
-| D-pad          | Arrow keys |
-| A              | Z         |
-| B              | X         |
-| 1 / 2          | Q / W     |
+| Wiimote button | Key         |
+| -------------- | ----------- |
+| D-pad          | Arrow keys  |
+| A / B          | Z / X       |
+| 1 / 2          | Q / W       |
 | + / −          | Enter / Esc |
-| Home           | Space     |
+| Home           | Space       |
 
-Guitar (Xplorer-keyboard) profile maps frets to A/S/D/F/G, strum to
-arrow up/down, +/− to Enter/Esc.
+Guitar profile maps frets to A/S/D/F/G, strum to arrow up/down, +/− to
+Enter/Esc.
 
-## Pairing a Wiimote
+## Pairing
 
-### Windows / Linux (auto-pair)
+**Windows / Linux (auto-pair)**: run `wiipair`, click **Scan for new devices
+(30 s)**, press **1+2** on the Wiimote (LEDs blink 1→2→3→4). The scanner
+finds it, completes the legacy-pair handshake (PIN = MAC reversed), enables
+HID. One player LED lights up steady when the host claims it; the row flips
+to "● connected" on the first input report and a virtual XInput pad is
+plugged.
 
-1. Run `wiipair`.
-2. Click **Scan for new devices (30 s)** in the top-right of the UI to
-   open a 30-second discovery window.
-3. Press **1+2** on the Wiimote — its 4 LEDs blink in sequence 1→2→3→4.
-   Within a few seconds the BT scan finds it, completes the legacy-pair
-   handshake (PIN = Wiimote's MAC reversed), and enables the HID profile.
-4. The Wiimote appears in the UI; one player LED lights up steady to
-   confirm the host has claimed it. The first input report flips the row
-   to "● connected" and a virtual Xbox 360 pad is plugged via the
-   platform's output backend.
+**macOS (manual)**: pair via *System Settings → Bluetooth*. Press 1+2 on
+the Wiimote, click "Connect" on the *Nintendo RVL-CNT-01* entry; WiiPair
+picks it up via hidapi.
 
-If auto-pair fails for a particular dongle/driver combo, fall back to
-manual pairing — see [Troubleshooting](#troubleshooting) below.
+If auto-pair fails for a particular dongle, fall back to manual pairing
+through the OS Bluetooth settings — see [Troubleshooting](#troubleshooting).
 
-### macOS (manual)
+## UI
 
-macOS doesn't expose the BlueZ-style agent API that lets a user-space
-app supply the legacy PIN, so pairing has to go through *System Settings →
-Bluetooth*. Press 1+2 on the Wiimote, click "Connect" on the
-"Nintendo RVL-CNT-01" entry that appears, and once paired the WiiPair UI
-picks it up.
-
-## Using the UI
-
-- **Connect / Disconnect** — toggles the HID handle. Disconnect sets a
-  sticky flag so auto-retry stays out of the way until you click Connect
-  again.
-- **Identify** — vibrates the controller for ~0.6 s with its player LED
-  flashing, so you can tell which row corresponds to which physical
-  device.
-- **Forget** — disconnects, drops the device from the saved list, *and*
-  unpairs it from the OS Bluetooth registry so it doesn't auto-rejoin.
-  A confirmation dialog protects you from misclicks.
-- **Profile dropdown** in the device card footer — switch the mapping
-  layout on the fly. The new profile applies immediately to the
-  already-plugged virtual pad.
-- **Click on the MAC** in the device header — copies it to the clipboard
-  (useful when you need to feed it to `bluetoothctl` or Windows BT
-  settings).
+- **Connect / Disconnect** toggles the HID handle. Disconnect is sticky:
+  auto-retry stays off until you click Connect again.
+- **Identify** rumbles + LED-flashes the device for ~0.6 s.
+- **Forget** disconnects, drops the device from the saved list, *and*
+  unpairs it from the OS (with confirmation).
+- **Profile dropdown** in the device card footer switches mapping live —
+  the new profile applies to the already-plugged virtual pad.
+- **Click on the MAC** in the device header copies it to the clipboard.
 - **Log filter checkboxes** — Info / Warn / Error toggle visibility per
-  level. With everything unchecked the log shows all lines.
+  level; everything unchecked shows all.
 
 ## Troubleshooting
 
-### Wii Remote Plus (`RVL-CNT-01-TR`) and stuck-pairing recovery — Windows
+### Wii Remote Plus stuck pairing — Windows
 
-The Wii Remote Plus has two known Windows-side quirks that surface
-after a power-cycle:
-
-* **Stale SDP cache** — Windows holds onto BT service entries from the
-  previous session. `BluetoothSetServiceState(HID)` fails with
-  `ERROR_INVALID_PARAMETER` (0x57) until the device is removed and
-  re-paired.
-* **Stuck auth state** — the BT registry holds a half-paired entry
-  (`paired=false, connected=true`). `BluetoothAuthenticateDeviceEx`
-  refuses to start with `ERROR_GEN_FAILURE` (0x1F) and Windows can
-  take well over a minute to clear it on its own.
-
-**WiiPair detects both signatures and auto-recovers.** When the
-scanner spots either error *during an active "Scan for new devices"
-window*, it:
-
-1. Logs `[BT] AA:BB:…: stale SDP cache detected` *or*
-   `stuck auth state detected (ERROR_GEN_FAILURE)`.
-2. Calls `BluetoothRemoveDevice` to drop the stale pairing.
-3. Forces an immediate re-scan so the next inquiry sees the Wiimote
-   as fresh and re-pairs it from scratch using the legacy 1+2 PIN.
-
-You just need to keep holding 1+2 on the Wiimote (the LEDs blinking in
-sequence 1→2→3→4) for a couple of extra seconds while the recovery
-runs. No need to open Windows BT settings.
-
-Auto-recovery only fires while a manual scan window is active — outside
-of it the daemon won't depair a "good but offline" device, since
-without 1+2 held the next inquiry won't find it again. If you see one
-of those log lines outside a scan window, click **Scan for new
-devices** and press 1+2 to trigger the recovery.
-
-The original Wii Remote (`RVL-CNT-01`) doesn't usually trip either
-quirk on most Windows builds.
+Wii Remote Plus has two known Windows-side quirks after a power-cycle:
+a stale SDP cache (`SetServiceState` returns `ERROR_INVALID_PARAMETER`)
+and a stuck half-paired registry entry (`AuthenticateDeviceEx` returns
+`ERROR_GEN_FAILURE`). **WiiPair detects both and auto-recovers** during
+an active "Scan for new devices" window: it unpairs the stale entry and
+forces a fresh inquiry. Just keep holding 1+2 on the Wiimote for a couple
+of extra seconds while the recovery runs. If you see the recovery log
+line outside a scan window, click *Scan for new devices* and press 1+2
+to trigger it. The original Wii Remote (`RVL-CNT-01`) doesn't usually
+trip these.
 
 ### Pairing hangs
 
-If a Wiimote sits stuck on "*[BT] pairing …*" for 20+ seconds, WiiPair
-pops a recovery dialog. The OS Bluetooth driver has wedged inside the
-auth call and there's nothing user-space can do to unstick it. Follow
-the steps in the dialog (toggle Bluetooth off/on in the OS, pull the
-Wiimote batteries for 30 s, then re-scan). If it still hangs, close and
-re-open WiiPair — a fresh process clears whatever stale state the OS BT
-stack has accumulated.
+If a device is stuck on "*pairing…*" for 20+ s, WiiPair pops a recovery
+dialog (toggle Bluetooth off/on, pull the batteries for 30 s, re-scan).
+If the dialog won't clear it, restart WiiPair — a fresh process clears
+whatever stale state the OS BT stack accumulated.
 
 ### Bluetooth radio compatibility
 
-Not every Bluetooth radio plays nicely with the Wiimote's quirky
-legacy-2.0 profile. In rough order of "most reliable" to "most painful":
-
-- **CSR / Broadcom BT 2.1+EDR USB dongles** — generally the most
-  reliable for both auto-pair and sustained reporting.
-- **Modern Intel AX-series adapters** — usually fine on Windows 11; some
-  driver combos drop reports during inquiry windows. WiiPair pauses
-  inquiry while a device is connected to mitigate this.
-- **Realtek BT chipsets** — mixed; some refuse the legacy PIN. Use
-  manual pairing.
-- **MediaTek / no-name dongles** — often unable to complete the legacy
-  pairing exchange. Try another dongle.
-
-If your dongle keeps failing, the manual-pairing fallback (Windows BT
-settings → Add device → choose "without code") works on virtually any
-combo. Once Windows has paired the device, WiiPair picks it up via
-hidapi without needing the auto-pair path.
+Reliability roughly: **CSR / Broadcom 2.1+EDR USB dongles** > **Intel
+AX-series** > **Realtek** > **MediaTek / no-name**. WiiPair pauses
+inquiry while a device is connected to mitigate report drops. If your
+dongle keeps failing auto-pair, manual pairing through the OS Bluetooth
+settings (choose "without code") works on virtually any combo — once
+the OS has paired the device, WiiPair picks it up via hidapi.
 
 ### Third-party / clone Wiimotes
 
-Hyperkin and various unbranded "Wii Remote-compatible" controllers
-mostly work, but some refuse the legacy PIN exchange and need manual
-pairing. A handful of clones don't expose the standard extension IDs
-on the `0xa400fa` register, so extension auto-detection fails — the
-controller still works as a bare Wiimote.
+Hyperkin and unbranded clones mostly work; some refuse the legacy PIN
+(use manual pairing) and a handful don't expose standard extension IDs
+(extension auto-detect fails, but the bare Wiimote still works).
 
-### "Virtual controller output unavailable" (Windows)
+### "Virtual controller output unavailable" — Windows
 
-ViGEmBus isn't installed or the driver isn't running. WiiPair pops a
-dedicated install dialog at startup (with a button to the download
-page) when the probe fails outright. If the message appears later
-(during a connect cycle), the daemon now retries `output_for_profile`
-every ~3 s in the background and clears the red error as soon as
-ViGEmBus comes back — log line `virtual gamepad ready for AA:BB:…
-(recovered after retry)` confirms the recovery.
+ViGEmBus isn't installed or running. WiiPair pops a dedicated install
+dialog at startup; later disconnect/reconnect cycles retry every ~3 s
+and clear the error when ViGEmBus comes back. If it never recovers,
+reinstall from the [ViGEmBus releases](https://github.com/nefarius/ViGEmBus/releases)
+and check for **HidHide** hiding the Wiimote's raw HID.
 
-If the retry never succeeds: reinstall ViGEmBus from the
-[releases page](https://github.com/nefarius/ViGEmBus/releases) and
-reboot. If you have **HidHide** installed, check that it isn't hiding
-the Wiimote's raw HID — that confuses ViGEm's plug routine.
+### Report gaps
 
-### Reports stalling for ~1 s
-
-A "*report gap: NNN ms*" warning in the log usually means the BT
-controller dropped into a sniff window. WiiPair sends a 5 Hz keepalive
-on every connected Wiimote to suppress this. If you still see frequent
-gaps and you have multiple Wiimotes connected at once, try disabling
-discovery while you're playing (the in-app inquiry pauses automatically
-when at least one device is connected, but if the user is actively
-clicking *Scan for new devices* during play it'll briefly steal the
-radio).
+A *report gap: NNN ms* warning means the BT controller dropped into a
+sniff window. WiiPair sends a 5 Hz keepalive to suppress this. If gaps
+persist with multiple Wiimotes connected, avoid clicking *Scan for new
+devices* during play (it briefly steals the radio).
 
 ### Linux: pad doesn't appear in games
 
-Make sure your user is in the `input` group (`groups | grep input`)
-and that the udev rule from `docs/udev/99-wiipair.rules` is installed.
-Some games cache the controller list at startup — restart the game
-after launching WiiPair.
-
-If `hid-wiimote` is loaded, the kernel will claim the device first and
-expose it as a synthetic keyboard/mouse. Either blacklist the module or
-unbind the specific device from `/sys/bus/hid/drivers/wiimote/unbind`
-after pairing.
+Check you're in the `input` group (`groups | grep input`) and the udev
+rule is installed. Some games cache the controller list at startup —
+restart the game after launching WiiPair. Also confirm `hid-wiimote`
+isn't loaded (see [Install → Linux](#linux)).
 
 ### macOS: keys don't work
 
-WiiPair needs **Accessibility** permission to inject keyboard events.
-*System Settings → Privacy & Security → Accessibility* → toggle
-WiiPair on. You may need to remove and re-add the binary if you've
-rebuilt it, since macOS keys the permission on the binary's signature.
+Allow WiiPair under *System Settings → Privacy & Security → Accessibility*.
+Re-add the binary if you've rebuilt — macOS keys the permission to the
+binary's signature.
 
 ## License
 
-Released under the **MIT License** — see [LICENSE](LICENSE).
-
-You are free to use, modify, redistribute, and embed WiiPair in commercial or
-proprietary projects. The only requirement is including the (very short) MIT
-copyright notice with substantial copies of the source.
+MIT — see [LICENSE](LICENSE).
 
 ## Acknowledgements
 
-- [WiiBrew](https://wiibrew.org/) — protocol documentation for Wiimote and
-  every extension.
-- [Linux `hid-wiimote`](https://github.com/torvalds/linux/tree/master/drivers/hid)
-  — reference for extension data bit layouts.
-- [ViGEmBus](https://github.com/nefarius/ViGEmBus) — virtual controller
-  driver that makes the Windows XInput emulation possible.
-- [`hidapi-rs`](https://github.com/ruabmbua/hidapi-rs),
-  [`vigem-client`](https://github.com/CasualX/vigem-client),
-  [`bluer`](https://github.com/bluez/bluer) (Linux BlueZ DBus),
-  [`evdev`](https://github.com/emberian/evdev) (Linux uinput),
-  [`core-graphics`](https://github.com/servo/core-foundation-rs) (macOS
-  CGEvent),
-  [`eframe`/`egui`](https://github.com/emilk/egui) — the Rust crates this
-  project leans on.
+[WiiBrew](https://wiibrew.org/) for the protocol docs;
+[Linux `hid-wiimote`](https://github.com/torvalds/linux/tree/master/drivers/hid)
+for extension data layouts;
+[ViGEmBus](https://github.com/nefarius/ViGEmBus) for the Windows virtual
+pad driver; and the Rust ecosystem this leans on —
+[`hidapi-rs`](https://github.com/ruabmbua/hidapi-rs),
+[`vigem-client`](https://github.com/CasualX/vigem-client),
+[`bluer`](https://github.com/bluez/bluer),
+[`evdev`](https://github.com/emberian/evdev),
+[`core-graphics`](https://github.com/servo/core-foundation-rs),
+[`eframe`/`egui`](https://github.com/emilk/egui).
