@@ -4,7 +4,6 @@ use hidapi::{HidApi, HidDevice};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::thread;
-use std::time::Duration;
 use tracing::debug;
 use wiimote_core::{is_wiimote, parse_input};
 
@@ -75,8 +74,10 @@ impl HidTransport {
         let cpath = CString::new(info.id.0.clone())
             .map_err(|e| TransportError::Io(format!("path contains NUL: {e}")))?;
         let device = self.api.open_path(&cpath)?;
-        // Wiimotes need non-blocking reads when we also want to drain writes
-        // on the same thread; we use timeout-based reads instead.
+        // We share the same thread for reads and writes: each iteration
+        // drains pending writes first, then does a short read_timeout.
+        // Explicit blocking-mode keeps `read_timeout` semantics deterministic
+        // across hidapi backends (libusb/hidraw/Win32).
         device
             .set_blocking_mode(true)
             .map_err(TransportError::from)?;
@@ -219,10 +220,6 @@ fn io_loop(
                 break;
             }
         }
-
-        // Tiny yield so we don't pin a CPU core if the device is silent
-        // and there are no writes pending.
-        thread::sleep(Duration::from_millis(1));
     }
     let _ = events.send(TransportEvent::DeviceLost(id));
 }

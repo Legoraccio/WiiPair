@@ -25,6 +25,7 @@ pub const PID_WIIMOTE: u16 = 0x0306;
 pub const PID_WIIMOTE_PLUS: u16 = 0x0330;
 
 /// Returns true if the (vendor, product) pair identifies any Wiimote variant.
+#[must_use]
 pub fn is_wiimote(vid: u16, pid: u16) -> bool {
     vid == VID_NINTENDO && (pid == PID_WIIMOTE || pid == PID_WIIMOTE_PLUS)
 }

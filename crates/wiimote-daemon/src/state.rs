@@ -52,6 +52,7 @@ pub struct DeviceSnapshot {
 }
 
 impl DeviceSnapshot {
+    #[must_use]
     pub fn new(id: String, name: String, path: String) -> Self {
         Self {
             id,
@@ -238,5 +239,123 @@ impl DeviceRegistry {
         self.map
             .iter()
             .find_map(|(id, r)| (r.snapshot.path == path).then(|| id.clone()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snap(id: &str, path: &str) -> DeviceSnapshot {
+        DeviceSnapshot::new(id.to_string(), "Wii Remote".to_string(), path.to_string())
+    }
+
+    fn runtime(id: &str, path: &str) -> DeviceRuntime {
+        DeviceRuntime::new(snap(id, path))
+    }
+
+    #[test]
+    fn rekey_moves_entry_under_new_id() {
+        let mut reg = DeviceRegistry::default();
+        reg.insert(runtime("path-A", "path-A"));
+        assert!(reg.rekey("path-A", "AA:BB:CC:DD:EE:FF"));
+        assert!(reg.get("path-A").is_none());
+        let r = reg.get("AA:BB:CC:DD:EE:FF").expect("rekeyed");
+        assert_eq!(r.snapshot.id, "AA:BB:CC:DD:EE:FF");
+    }
+
+    #[test]
+    fn rekey_is_noop_for_missing_or_colliding_keys() {
+        let mut reg = DeviceRegistry::default();
+        reg.insert(runtime("path-A", "path-A"));
+        reg.insert(runtime("path-B", "path-B"));
+        // Same key — refuse, leave entries untouched.
+        assert!(!reg.rekey("path-A", "path-A"));
+        // Target already exists — refuse.
+        assert!(!reg.rekey("path-A", "path-B"));
+        // Source missing — refuse.
+        assert!(!reg.rekey("not-here", "anywhere"));
+        // Both originals still in place.
+        assert!(reg.get("path-A").is_some());
+        assert!(reg.get("path-B").is_some());
+    }
+
+    #[test]
+    fn lowest_free_slot_starts_at_zero_and_climbs() {
+        let mut reg = DeviceRegistry::default();
+        // Empty registry: first device should get slot 0.
+        assert_eq!(reg.lowest_free_slot(), Some(0));
+        let mut r = runtime("a", "a");
+        r.slot = Some(0);
+        reg.insert(r);
+        assert_eq!(reg.lowest_free_slot(), Some(1));
+        let mut r = runtime("b", "b");
+        r.slot = Some(1);
+        reg.insert(r);
+        assert_eq!(reg.lowest_free_slot(), Some(2));
+    }
+
+    #[test]
+    fn lowest_free_slot_fills_gaps() {
+        let mut reg = DeviceRegistry::default();
+        let mut r0 = runtime("a", "a");
+        r0.slot = Some(0);
+        let mut r2 = runtime("c", "c");
+        r2.slot = Some(2);
+        reg.insert(r0);
+        reg.insert(r2);
+        // Slot 1 is the gap.
+        assert_eq!(reg.lowest_free_slot(), Some(1));
+    }
+
+    #[test]
+    fn lowest_free_slot_caps_at_four() {
+        let mut reg = DeviceRegistry::default();
+        for s in 0u8..4 {
+            let id = format!("d{s}");
+            let mut r = runtime(&id, &id);
+            r.slot = Some(s);
+            reg.insert(r);
+        }
+        // All four XInput slots taken → no room.
+        assert_eq!(reg.lowest_free_slot(), None);
+    }
+
+    #[test]
+    fn id_for_path_finds_exact_match_only() {
+        let mut reg = DeviceRegistry::default();
+        reg.insert(runtime("AA:BB:CC:DD:EE:01", "\\\\?\\hid#vid_057e&pid_0306#7"));
+        assert_eq!(
+            reg.id_for_path("\\\\?\\hid#vid_057e&pid_0306#7").as_deref(),
+            Some("AA:BB:CC:DD:EE:01"),
+        );
+        assert!(reg.id_for_path("\\\\?\\hid#vid_057e&pid_0306#9").is_none());
+    }
+
+    #[test]
+    fn reset_session_clears_runtime_state_but_keeps_identity_and_extension_hint() {
+        let mut r = runtime("AA:BB:CC:DD:EE:02", "path");
+        r.snapshot.connected = true;
+        r.snapshot.extension = Some(ExtensionType::Guitar);
+        r.snapshot.battery = Some(75);
+        r.pending = true;
+        r.ext_phase = Some(ExtensionPhase::InitSent);
+        r.slot = Some(2);
+        r.last_keepalive = Some(Instant::now());
+
+        r.reset_session();
+
+        // Identity preserved.
+        assert_eq!(r.snapshot.id, "AA:BB:CC:DD:EE:02");
+        assert_eq!(r.snapshot.path, "path");
+        // Extension hint preserved (drives offline icon).
+        assert_eq!(r.snapshot.extension, Some(ExtensionType::Guitar));
+        // Session state wiped.
+        assert!(!r.snapshot.connected);
+        assert!(!r.pending);
+        assert_eq!(r.ext_phase, None);
+        assert_eq!(r.slot, None);
+        assert_eq!(r.last_keepalive, None);
+        assert!(r.snapshot.ext_data.is_none());
     }
 }

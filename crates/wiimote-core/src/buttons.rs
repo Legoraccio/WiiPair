@@ -22,6 +22,7 @@ bitflags! {
 impl Buttons {
     /// Parse the 2-byte button field as it appears in input reports
     /// (bytes immediately after the report ID).
+    #[must_use]
     pub fn parse(byte0: u8, byte1: u8) -> Self {
         Self::from_bits_truncate(u16::from_le_bytes([byte0, byte1]))
     }

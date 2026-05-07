@@ -19,6 +19,7 @@
 use bitflags::bitflags;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ExtensionType {
     Nunchuk,
     ClassicController,
@@ -39,6 +40,7 @@ pub enum ExtensionType {
 
 impl ExtensionType {
     /// Map a 6-byte plain (post-0x55-init) extension ID to a known type.
+    #[must_use]
     pub fn from_id(id: &[u8; 6]) -> Self {
         match id {
             [0x00, 0x00, 0xa4, 0x20, 0x00, 0x00] => Self::Nunchuk,
@@ -59,6 +61,7 @@ impl ExtensionType {
 
     /// Short user-facing name. For [`Self::Unknown`] the raw ID bytes
     /// are formatted in hex.
+    #[must_use]
     pub fn label(&self) -> String {
         match self {
             Self::Nunchuk => "Nunchuk".into(),
@@ -96,6 +99,7 @@ pub enum ExtensionData {
 impl ExtensionData {
     /// Decode the 16-byte extension payload from a 0x35 report given
     /// the previously-identified extension type.
+    #[must_use]
     pub fn parse(ext: ExtensionType, raw: &[u8; 16]) -> Self {
         match ext {
             ExtensionType::Nunchuk => Self::Nunchuk(NunchukState::parse(raw)),
@@ -110,6 +114,7 @@ impl ExtensionData {
 
     /// Names of the buttons currently held on the extension. Useful for
     /// quick UI display.
+    #[must_use]
     pub fn pressed_button_labels(&self) -> Vec<&'static str> {
         match self {
             Self::Nunchuk(s) => s.pressed_buttons(),
@@ -132,6 +137,7 @@ pub struct NunchukState {
 }
 
 impl NunchukState {
+    #[must_use]
     pub fn parse(b: &[u8; 16]) -> Self {
         // Buttons live in byte 5, inverted (1 = released).
         Self {
@@ -142,6 +148,7 @@ impl NunchukState {
         }
     }
 
+    #[must_use]
     pub fn pressed_buttons(&self) -> Vec<&'static str> {
         let mut v = Vec::new();
         if self.c {
@@ -185,6 +192,7 @@ pub struct ClassicState {
 }
 
 impl ClassicState {
+    #[must_use]
     pub fn parse(b: &[u8; 16]) -> Self {
         // Buttons in bytes 4-5, inverted: 0 = pressed.
         let raw = u16::from_be_bytes([b[4], b[5]]);
@@ -193,6 +201,7 @@ impl ClassicState {
         }
     }
 
+    #[must_use]
     pub fn pressed_buttons(&self) -> Vec<&'static str> {
         let mut v = Vec::new();
         for (flag, name) in [
@@ -252,6 +261,7 @@ pub struct GuitarState {
 }
 
 impl GuitarState {
+    #[must_use]
     pub fn parse(b: &[u8; 16]) -> Self {
         let raw = u16::from_be_bytes([b[4], b[5]]);
         Self {
@@ -263,6 +273,7 @@ impl GuitarState {
         }
     }
 
+    #[must_use]
     pub fn pressed_buttons(&self) -> Vec<&'static str> {
         let mut v = Vec::new();
         for (flag, name) in [
@@ -308,6 +319,7 @@ pub struct DrumsState {
 }
 
 impl DrumsState {
+    #[must_use]
     pub fn parse(b: &[u8; 16]) -> Self {
         let raw = u16::from_be_bytes([b[4], b[5]]);
         Self {
@@ -315,6 +327,7 @@ impl DrumsState {
         }
     }
 
+    #[must_use]
     pub fn pressed_buttons(&self) -> Vec<&'static str> {
         let mut v = Vec::new();
         for (flag, name) in [

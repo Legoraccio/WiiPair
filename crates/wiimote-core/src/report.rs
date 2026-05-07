@@ -192,9 +192,9 @@ fn need(buf: &[u8], n: usize) -> Result<(), ReportError> {
 /// * Y gets bit 5 of buttons[1] (only one LSB; the very lowest bit is dropped)
 /// * Z gets bit 6 of buttons[1]
 fn parse_accel(bb0: u8, bb1: u8, xh: u8, yh: u8, zh: u8) -> Accelerometer {
-    let x = ((xh as u16) << 2) | (((bb0 >> 5) & 0x03) as u16);
-    let y = ((yh as u16) << 2) | (((bb1 & 0x20) >> 4) as u16);
-    let z = ((zh as u16) << 2) | (((bb1 & 0x40) >> 5) as u16);
+    let x = (u16::from(xh) << 2) | u16::from((bb0 >> 5) & 0x03);
+    let y = (u16::from(yh) << 2) | u16::from((bb1 & 0x20) >> 4);
+    let z = (u16::from(zh) << 2) | u16::from((bb1 & 0x40) >> 5);
     Accelerometer { x, y, z }
 }
 
@@ -205,9 +205,9 @@ fn parse_ir_extended(buf: &[u8]) -> IrDots {
     debug_assert!(buf.len() >= 12);
     let mut dots = [IrDot::default(); 4];
     for (i, dot) in dots.iter_mut().enumerate() {
-        let b0 = buf[i * 3] as u16;
-        let b1 = buf[i * 3 + 1] as u16;
-        let b2 = buf[i * 3 + 2] as u16;
+        let b0 = u16::from(buf[i * 3]);
+        let b1 = u16::from(buf[i * 3 + 1]);
+        let b2 = u16::from(buf[i * 3 + 2]);
         let x = ((b2 & 0x30) << 4) | b0;
         let y = ((b2 & 0xC0) << 2) | b1;
         let size = (b2 & 0x0F) as u8;
@@ -243,6 +243,7 @@ pub enum OutputReport {
 }
 
 impl OutputReport {
+    #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         match self {
             Self::SetLeds { leds, rumble } => {

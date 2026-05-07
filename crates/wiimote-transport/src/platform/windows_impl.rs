@@ -72,6 +72,7 @@ impl PlatformScanner {
     /// while there's at least one Wiimote connected — otherwise the
     /// inquiry's hop windows briefly starve the active connection,
     /// causing visible "freezes" in the input stream.
+    #[must_use]
     pub fn pause_handle(&self) -> Arc<AtomicBool> {
         self.pause_inquiry.clone()
     }
@@ -222,9 +223,16 @@ fn inquiry() -> Result<Vec<DiscoveredDevice>, String> {
         hRadio: HANDLE::default(),
     };
 
+    // SAFETY: `BLUETOOTH_DEVICE_INFO` is a `#[repr(C)]` POD struct
+    // whose all-zero pattern is a valid (if dwSize-invalid) instance.
+    // We immediately initialise `dwSize` below, which is the field
+    // BT APIs check first.
     let mut info: BLUETOOTH_DEVICE_INFO = unsafe { zeroed() };
     info.dwSize = size_of::<BLUETOOTH_DEVICE_INFO>() as u32;
 
+    // SAFETY: `params` and `info` are stack-allocated, fully
+    // initialised, and live across the call; `BluetoothFindFirstDevice`
+    // either fills `info` and returns a non-null handle or returns Err.
     let h = match unsafe { BluetoothFindFirstDevice(&params, &mut info) } {
         Ok(h) => h,
         Err(_) => return Ok(Vec::new()), // typically ERROR_NO_MORE_ITEMS
@@ -237,14 +245,22 @@ fn inquiry() -> Result<Vec<DiscoveredDevice>, String> {
             name: u16_array_to_string(&info.szName),
         });
 
+        // SAFETY: same justification as the first `zeroed()` above —
+        // `BLUETOOTH_DEVICE_INFO` is plain POD; `dwSize` is reset
+        // immediately to satisfy the API contract.
         info = unsafe { zeroed() };
         info.dwSize = size_of::<BLUETOOTH_DEVICE_INFO>() as u32;
 
+        // SAFETY: `h` is a live find-handle from `FindFirstDevice`;
+        // `info` is initialised. `FindNextDevice` returns Err on
+        // ERROR_NO_MORE_ITEMS, which we use as the loop terminator.
         if unsafe { BluetoothFindNextDevice(h, &mut info) }.is_err() {
             break;
         }
     }
 
+    // SAFETY: closing exactly once a handle that was successfully
+    // returned by `FindFirstDevice`.
     let _ = unsafe { BluetoothFindDeviceClose(h) };
     Ok(out)
 }
@@ -254,6 +270,10 @@ fn is_wiimote_name(s: &str) -> bool {
 }
 
 fn bt_addr_u64(info: &BLUETOOTH_DEVICE_INFO) -> u64 {
+    // SAFETY: `BLUETOOTH_ADDRESS` is a C union of `[u8; 6]` plus a
+    // `u64`; reading the `ullLong` variant always yields a defined
+    // value because the underlying bytes are fully initialised by
+    // the BT stack.
     unsafe { info.Address.Anonymous.ullLong }
 }
 
@@ -270,28 +290,68 @@ fn u16_array_to_string(s: &[u16]) -> String {
 /// `BluetoothAuthenticateDeviceEx` call; the callback dereferences it
 /// to pull the PIN, the radio handle, and to push diagnostic events
 /// back into the UI.
+///
+/// Lifetime contract (uphold-or-UB):
+/// 1. The raw pointer passed to `BluetoothRegisterForAuthenticationEx`
+///    must outlive any callback fire.
+/// 2. `BluetoothUnregisterAuthentication` must be called before the
+///    box is freed. MS callback APIs are conventionally synchronous —
+///    Unregister waits for in-flight callbacks to return — but as a
+///    second line of defence we set [`PairContext::active`] to `false`
+///    *before* freeing, and the callback bails on a poisoned flag.
 struct PairContext {
     pin: [u8; 6],
     addr: u64,
     h_radio: HANDLE,
     events: Sender<ScannerEvent>,
+    /// Cleared right before the box is dropped. Defensive: a stray
+    /// callback that races with teardown sees `false` and returns
+    /// without touching the (about-to-be-freed) other fields.
+    active: AtomicBool,
 }
 
 impl Drop for PairContext {
     fn drop(&mut self) {
-        // Close the radio handle when the box is freed (i.e. after
-        // `BluetoothAuthenticateDeviceEx` returns and we
-        // `Box::from_raw` in `pair`).
+        // SAFETY: `h_radio` was obtained from `BluetoothFindFirstRadio`
+        // and stored in this context; we own it and free it exactly
+        // once via this Drop after `Box::from_raw` in `pair()`.
         let _ = unsafe { CloseHandle(self.h_radio) };
     }
 }
 
+/// # Safety
+/// * `pv_param` must be the pointer registered with
+///   `BluetoothRegisterForAuthenticationEx`, pointing to a live
+///   [`PairContext`] whose `active` flag has not yet been cleared.
+/// * `p_params` must point to a valid
+///   `BLUETOOTH_AUTHENTICATION_CALLBACK_PARAMS` provided by the BT
+///   stack for the duration of this call.
+///
+/// Both invariants are enforced by the Win32 BT auth callback contract;
+/// nevertheless we defensively null-check and consult the `active`
+/// flag before dereferencing — see the lifetime contract on
+/// [`PairContext`].
 unsafe extern "system" fn auth_callback(
     pv_param: *const c_void,
     p_params: *const BLUETOOTH_AUTHENTICATION_CALLBACK_PARAMS,
 ) -> BOOL {
+    if pv_param.is_null() || p_params.is_null() {
+        // The BT stack should never pass NULL — if it does (driver
+        // misbehaviour, callback fired after registry corruption) we
+        // bail rather than UB.
+        return FALSE;
+    }
+    let ctx_ptr = pv_param as *const PairContext;
+    // SAFETY: Per the function-level safety contract, `pv_param`
+    // points to a live `PairContext`. Reading `active` first means
+    // any post-teardown stray fire stops here, before we touch the
+    // rest of the (potentially freed) box.
+    let active = (*ctx_ptr).active.load(Ordering::Acquire);
+    if !active {
+        return FALSE;
+    }
+    let ctx = &*ctx_ptr;
     let params = &*p_params;
-    let ctx = &*(pv_param as *const PairContext);
 
     debug!(
         "wiimote auth callback for {}: method = {:?}",
@@ -307,6 +367,9 @@ unsafe extern "system" fn auth_callback(
         return FALSE;
     }
 
+    // SAFETY: `BLUETOOTH_AUTHENTICATE_RESPONSE` is a `#[repr(C)]` POD
+    // struct whose all-zero pattern is a valid (uninitialised-style)
+    // instance; we set every meaningful field before use.
     let mut response: BLUETOOTH_AUTHENTICATE_RESPONSE = zeroed();
     response.bthAddressRemote = params.deviceInfo.Address;
     response.authMethod = BLUETOOTH_AUTHENTICATION_METHOD_LEGACY;
@@ -320,6 +383,11 @@ unsafe extern "system" fn auth_callback(
     // inside the driver after a manual unpair has perturbed BT state;
     // NULL goes through the same path the BT stack already chose for
     // this auth conversation.
+    //
+    // SAFETY: we are the BT-stack-invoked auth callback, so the stack
+    // is in a state where `SendAuthenticationResponseEx` may be called.
+    // `response` is fully initialised; the NULL handle is documented
+    // as valid input.
     let err = BluetoothSendAuthenticationResponseEx(HANDLE::default(), &response);
 
     if err == ERROR_SUCCESS.0 {
@@ -340,12 +408,15 @@ fn format_addr_short(addr: u64) -> String {
 }
 
 fn pair(info: &BLUETOOTH_DEVICE_INFO, events: &Sender<ScannerEvent>) -> Result<(), String> {
+    // SAFETY: reading the `rgBytes` variant of the BD-address union;
+    // see `bt_addr_u64` for the union-soundness justification.
     let bytes = unsafe { info.Address.Anonymous.rgBytes };
     // The Wiimote in 1+2 pairing mode expects the BD address bytes
     // in the order they're sent on the wire (LSB first per BT spec).
     // Windows already stores `rgBytes` LSB-first, so we pass it
     // through unchanged.
     let pin: [u8; 6] = bytes;
+    // SAFETY: same union, alternate variant — see `bt_addr_u64`.
     let addr = unsafe { info.Address.Anonymous.ullLong };
     debug!(
         "wiimote pair: PIN [{:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
@@ -362,12 +433,17 @@ fn pair(info: &BLUETOOTH_DEVICE_INFO, events: &Sender<ScannerEvent>) -> Result<(
         dwSize: size_of::<BLUETOOTH_FIND_RADIO_PARAMS>() as u32,
     };
     let mut h_radio: HANDLE = HANDLE::default();
+    // SAFETY: `radio_params` and `h_radio` are stack-allocated,
+    // initialised, and live across the call. Failure leaves
+    // `h_radio` untouched (HANDLE::default → null), which we
+    // discard along the early-return path.
     let h_find = match unsafe { BluetoothFindFirstRadio(&radio_params, &mut h_radio) } {
         Ok(h) => h,
         Err(_) => return Err("no Bluetooth radio found".into()),
     };
     // `h_find` is just the iterator handle; we close it immediately —
     // the radio handle survives until `PairContext` is dropped.
+    // SAFETY: closing a fresh, valid find-handle exactly once.
     let _ = unsafe { BluetoothFindRadioClose(h_find) };
 
     let ctx = Box::into_raw(Box::new(PairContext {
@@ -375,10 +451,15 @@ fn pair(info: &BLUETOOTH_DEVICE_INFO, events: &Sender<ScannerEvent>) -> Result<(
         addr,
         h_radio,
         events: events.clone(),
+        active: AtomicBool::new(true),
     }));
 
     let mut info_local = *info;
     let mut h_callback: isize = 0;
+    // SAFETY: `info_local`, `h_callback` and `ctx` are all live; the
+    // function pointer to `auth_callback` has the FFI-correct
+    // signature; `ctx` outlives the registration window because we
+    // call Unregister + Box::from_raw together below.
     let err = unsafe {
         BluetoothRegisterForAuthenticationEx(
             Some(&info_local),
@@ -388,10 +469,16 @@ fn pair(info: &BLUETOOTH_DEVICE_INFO, events: &Sender<ScannerEvent>) -> Result<(
         )
     };
     if err != ERROR_SUCCESS.0 {
+        // Registration failed → no callback can fire → safe to free.
+        // SAFETY: `ctx` came from `Box::into_raw` above; we drop it
+        // exactly once on this error path.
         let _ = unsafe { Box::from_raw(ctx) };
         return Err(format!("RegisterForAuthenticationEx 0x{err:08x}"));
     }
 
+    // SAFETY: `info_local` is live, `h_radio` is the handle we just
+    // resolved, and `MITMProtectionNotRequired` is a valid level
+    // constant from the Win32 BT enums.
     let auth_err = unsafe {
         BluetoothAuthenticateDeviceEx(
             HWND::default(),
@@ -402,8 +489,20 @@ fn pair(info: &BLUETOOTH_DEVICE_INFO, events: &Sender<ScannerEvent>) -> Result<(
         )
     };
 
+    // SAFETY: `h_callback` was set by `RegisterForAuthenticationEx`
+    // above and is matched 1:1 with this Unregister call.
     let _ = unsafe { BluetoothUnregisterAuthentication(h_callback) };
-    // Drops PairContext, which closes h_radio.
+    // Poison the active flag with Release semantics so any callback
+    // that snuck past Unregister (in case the BT stack's Unregister
+    // is ever observed not to drain in-flight callers) sees `false`
+    // via Acquire and bails before touching the box.
+    // SAFETY: `ctx` is still live (we haven't freed it yet); the
+    // pointer was returned by `Box::into_raw` of a `PairContext`.
+    unsafe { (*ctx).active.store(false, Ordering::Release) };
+    // SAFETY: `ctx` came from `Box::into_raw` and is freed exactly
+    // once here; Unregister has already retired the callback so no
+    // future fire can dereference it. Drops `PairContext`, which in
+    // turn closes `h_radio` via the type's Drop impl.
     let _ = unsafe { Box::from_raw(ctx) };
 
     if auth_err != ERROR_SUCCESS.0 {
@@ -426,8 +525,11 @@ fn enable_hid_service(
     events: &Sender<ScannerEvent>,
 ) -> Result<(), String> {
     let mut info_local = *info;
+    // SAFETY: union variant read — see `bt_addr_u64`.
     let addr = unsafe { info.Address.Anonymous.ullLong };
     let result = with_radio(|h_radio| unsafe {
+        // SAFETY: `with_radio` hands us a valid live radio handle for
+        // the duration of this closure.
         // Refresh the cached BT registry record for this device. The
         // info returned by inquiry can be missing post-pair service
         // entries, which can cause SetServiceState to choke with
@@ -521,6 +623,9 @@ pub fn unpair(addr: u64) -> Result<(), String> {
         Anonymous:
             windows::Win32::Devices::Bluetooth::BLUETOOTH_ADDRESS_0 { ullLong: addr },
     };
+    // SAFETY: `address` is a fully-initialised stack value of the
+    // expected `BLUETOOTH_ADDRESS` shape. The function takes a const
+    // pointer and reads only `ullLong` worth of bytes.
     let rc = unsafe { BluetoothRemoveDevice(&address) };
     if rc == ERROR_SUCCESS.0 {
         Ok(())
@@ -538,12 +643,18 @@ fn with_radio<T>(f: impl FnOnce(HANDLE) -> T) -> Result<T, String> {
         dwSize: size_of::<BLUETOOTH_FIND_RADIO_PARAMS>() as u32,
     };
     let mut h_radio: HANDLE = HANDLE::default();
+    // SAFETY: stack-allocated `radio_params` and `h_radio` outlive
+    // the call; `FindFirstRadio` either fills `h_radio` and returns
+    // a non-null find-handle or returns Err.
     let h_find = match unsafe { BluetoothFindFirstRadio(&radio_params, &mut h_radio) } {
         Ok(h) => h,
         Err(_) => return Err("no Bluetooth radio found".into()),
     };
+    // SAFETY: closing exactly once a fresh, valid find-handle.
     let _ = unsafe { BluetoothFindRadioClose(h_find) };
     let result = f(h_radio);
+    // SAFETY: closing exactly once the radio handle we just resolved
+    // and held over the closure call.
     let _ = unsafe { CloseHandle(h_radio) };
     Ok(result)
 }

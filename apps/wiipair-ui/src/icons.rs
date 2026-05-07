@@ -13,8 +13,8 @@ pub fn draw_device_icon(ui: &mut egui::Ui, d: &DeviceSnapshot) {
         Some(ExtensionType::Guitar) => paint_guitar_icon(&painter, rect),
         Some(ExtensionType::Drums) => paint_drums_icon(&painter, rect),
         Some(ExtensionType::Nunchuk) => paint_nunchuk_icon(&painter, rect),
-        Some(ExtensionType::ClassicController) | Some(ExtensionType::ClassicControllerPro) => {
-            paint_classic_icon(&painter, rect)
+        Some(ExtensionType::ClassicController | ExtensionType::ClassicControllerPro) => {
+            paint_classic_icon(&painter, rect);
         }
         Some(ExtensionType::DjHeroTurntable) => paint_turntable_icon(&painter, rect),
         _ => paint_wiimote_icon(&painter, rect),

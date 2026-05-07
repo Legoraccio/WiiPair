@@ -43,7 +43,22 @@ fn main() -> eframe::Result {
         .with(UiLogLayer)
         .init();
 
-    let daemon = Daemon::start().expect("daemon failed to start");
+    let daemon = match Daemon::start() {
+        Ok(d) => d,
+        Err(e) => {
+            // Fatal: nothing the UI can do without a running daemon.
+            // On Windows release the console is hidden, so a plain
+            // panic produces a silent crash. Show a dedicated error
+            // window with the failure detail and a Close button.
+            eprintln!("daemon failed to start: {e}");
+            return show_fatal_error(format!(
+                "Could not start the WiiPair daemon:\n\n{e}\n\n\
+                 This usually means a Bluetooth radio could not be \
+                 initialised. Check that your BT adapter is enabled and \
+                 try again."
+            ));
+        }
+    };
     // Wire the layer's sink up now that the daemon has created its
     // event channel. Tracing events emitted in the brief window
     // before this point are dropped — that's only the very first
@@ -77,6 +92,49 @@ fn main() -> eframe::Result {
     )
 }
 
+/// Display a fatal-error window when the daemon (or any other startup
+/// dependency) can't initialise. This is the only path that runs
+/// without a `Daemon`, so it lives outside `App`. On Windows release
+/// builds the console is hidden — a plain panic yields a silent
+/// crash, which is why we go through the trouble of standing up a
+/// dedicated egui surface just for this case.
+fn show_fatal_error(message: String) -> eframe::Result {
+    let viewport = egui::ViewportBuilder::default()
+        .with_inner_size([540.0, 260.0])
+        .with_min_inner_size([420.0, 200.0])
+        .with_title("WiiPair — fatal error");
+    let opts = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
+    eframe::run_native(
+        "WiiPair — fatal error",
+        opts,
+        Box::new(move |_cc| Ok(Box::new(FatalErrorApp { message }))),
+    )
+}
+
+struct FatalErrorApp {
+    message: String,
+}
+
+impl eframe::App for FatalErrorApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(8.0);
+            ui.heading("WiiPair couldn't start");
+            ui.add_space(8.0);
+            ui.label(&self.message);
+            ui.add_space(16.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Close").clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+        });
+    }
+}
+
 /// How many recent log lines to retain in the on-screen scrollback.
 const LOG_CAPACITY: usize = 256;
 
@@ -108,18 +166,33 @@ impl LogFilter {
     }
 }
 
-struct App {
-    daemon: Daemon,
-    devices: Vec<DeviceSnapshot>,
-    log: VecDeque<LogLine>,
-    log_filter: LogFilter,
-    scan_active_until: Option<std::time::Instant>,
+/// Bundles the state of every modal/dialog the UI can show. Pulling
+/// these out of `App` keeps the App struct focused on data + plumbing
+/// — the driver probe, pairing-stuck recovery, and forget-confirm
+/// flows are otherwise unrelated to each other and the rest of the
+/// UI doesn't care about them between dialog impressions.
+#[derive(Default)]
+struct Modals {
     /// `Some(addr)` when the daemon told us a pairing attempt is hung;
     /// drives the recovery-instructions dialog.
     pairing_stuck: Option<u64>,
     /// `Some(id)` while the user is on the "are you sure?" forget
     /// dialog. Cleared on confirm/cancel.
     pending_forget: Option<String>,
+    /// Set at startup by `probe_default()` when the platform output
+    /// backend isn't ready; cleared once the user dismisses the
+    /// install-driver dialog.
+    driver_probe: Option<ProbeFailure>,
+    driver_dialog_dismissed: bool,
+}
+
+struct App {
+    daemon: Daemon,
+    devices: Vec<DeviceSnapshot>,
+    log: VecDeque<LogLine>,
+    log_filter: LogFilter,
+    scan_active_until: Option<std::time::Instant>,
+    modals: Modals,
     /// Per-frame channel populated by device cards; drained at the end
     /// of `render_devices_panel`. Lets the App intercept Forget into a
     /// confirmation modal while forwarding everything else verbatim.
@@ -129,11 +202,6 @@ struct App {
     /// disabled" / "ViGEmBus unavailable" so the user notices even
     /// after the original log line has scrolled off (U12).
     persistent_warnings: Vec<String>,
-    /// Set at startup by `probe_default()` when the platform output
-    /// backend isn't ready; cleared once the user dismisses the
-    /// install-driver dialog.
-    driver_probe: Option<ProbeFailure>,
-    driver_dialog_dismissed: bool,
 }
 
 impl App {
@@ -145,13 +213,13 @@ impl App {
             log: VecDeque::with_capacity(LOG_CAPACITY),
             log_filter: LogFilter::default(),
             scan_active_until: None,
-            pairing_stuck: None,
-            pending_forget: None,
+            modals: Modals {
+                driver_probe,
+                ..Modals::default()
+            },
             card_tx,
             card_rx,
             persistent_warnings: Vec::new(),
-            driver_probe,
-            driver_dialog_dismissed: false,
         }
     }
 
@@ -178,7 +246,7 @@ impl App {
                     self.scan_active_until = active_until;
                 }
                 UiEvent::PairingStuck { addr } => {
-                    self.pairing_stuck = Some(addr);
+                    self.modals.pairing_stuck = Some(addr);
                 }
             }
         }
@@ -265,7 +333,7 @@ impl App {
                                 )
                                 .clicked()
                             {
-                                let _ = self.daemon.commands_tx.send(UiCommand::StartScan);
+                                self.daemon.send_command(UiCommand::StartScan);
                             }
                         }
                     }
@@ -355,10 +423,10 @@ impl App {
         while let Ok(cmd) = self.card_rx.try_recv() {
             match cmd {
                 UiCommand::Forget(id) => {
-                    self.pending_forget = Some(id);
+                    self.modals.pending_forget = Some(id);
                 }
                 other => {
-                    let _ = self.daemon.commands_tx.send(other);
+                    self.daemon.send_command(other);
                 }
             }
         }
@@ -368,23 +436,23 @@ impl App {
         // Driver-missing dialog (ViGEmBus / uinput). Shown once at
         // startup; dismissing it sets a sticky flag so it doesn't
         // re-pop on every frame.
-        if let Some(failure) = &self.driver_probe {
-            if !self.driver_dialog_dismissed
+        if let Some(failure) = &self.modals.driver_probe {
+            if !self.modals.driver_dialog_dismissed
                 && dialogs::driver_missing_dialog(ctx, failure)
             {
-                self.driver_dialog_dismissed = true;
+                self.modals.driver_dialog_dismissed = true;
             }
         }
 
         // Pairing-stuck recovery dialog.
-        if let Some(addr) = self.pairing_stuck {
+        if let Some(addr) = self.modals.pairing_stuck {
             if dialogs::pairing_stuck_dialog(ctx, addr) {
-                self.pairing_stuck = None;
+                self.modals.pairing_stuck = None;
             }
         }
 
         // Forget confirmation.
-        if let Some(id) = self.pending_forget.clone() {
+        if let Some(id) = self.modals.pending_forget.clone() {
             let name = self
                 .devices
                 .iter()
@@ -395,9 +463,9 @@ impl App {
                 dialogs::confirm_forget_dialog(ctx, &name, &id)
             {
                 if decision {
-                    let _ = self.daemon.commands_tx.send(UiCommand::Forget(id));
+                    self.daemon.send_command(UiCommand::Forget(id));
                 }
-                self.pending_forget = None;
+                self.modals.pending_forget = None;
             }
         }
     }

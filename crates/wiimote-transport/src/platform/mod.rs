@@ -2,6 +2,39 @@
 //!
 //! On platforms where it isn't implemented yet, [`PlatformScanner::start`]
 //! is a no-op so the daemon can run unchanged.
+//!
+//! All three platform impls (`windows_impl`, `linux_impl`, `macos_impl`)
+//! plus the unsupported-platform stub satisfy the [`Scanner`] trait —
+//! that trait is the explicit cross-platform contract. The daemon
+//! itself goes through the [`PlatformScanner`] type alias re-exported
+//! below, but the trait makes it a compile error if one of the
+//! implementations forgets to provide a method.
+
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+/// Cross-platform contract every `PlatformScanner` impl must satisfy.
+/// Without this trait, divergence between Windows/Linux/macOS shapes is
+/// only caught at the daemon's call site — and only on whichever target
+/// happens to be compiled first.
+pub trait Scanner: Send {
+    /// Construct a fresh scanner that will publish discovery / pairing
+    /// outcomes into `events`. Failure here means a critical OS-level
+    /// dependency (Bluetooth stack, DBus, etc.) is missing.
+    fn new(events: crossbeam_channel::Sender<ScannerEvent>) -> anyhow::Result<Self>
+    where
+        Self: Sized;
+
+    /// Hand the daemon the pause flag so it can suspend active BT
+    /// inquiry while at least one Wiimote is connected — inquiry hop
+    /// windows otherwise starve the active connection.
+    fn pause_handle(&self) -> Arc<AtomicBool>;
+
+    /// Start the background scan thread. Returns `Err` if the OS
+    /// refuses to start one (e.g. macOS where the BT scanner isn't
+    /// implemented yet).
+    fn start(&mut self) -> anyhow::Result<()>;
+}
 
 #[derive(Debug, Clone)]
 pub enum ScannerEvent {
@@ -68,12 +101,31 @@ impl PlatformScanner {
         Ok(Self { _events: events })
     }
 
-    pub fn pause_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
+    pub fn pause_handle(&self) -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
     }
 
     pub fn start(&mut self) -> anyhow::Result<()> {
         Ok(())
+    }
+}
+
+// Single trait impl that compiles against whichever per-OS
+// `PlatformScanner` is gated in by the `cfg`s above. The body just
+// forwards to the inherent methods (no trait-method recursion: method
+// resolution prefers inherent over trait when both share a name) — so
+// adding a method to `Scanner` later will fail to compile on whichever
+// platform forgot to implement it inherently, instead of silently
+// diverging.
+impl Scanner for PlatformScanner {
+    fn new(events: crossbeam_channel::Sender<ScannerEvent>) -> anyhow::Result<Self> {
+        Self::new(events)
+    }
+    fn pause_handle(&self) -> Arc<AtomicBool> {
+        self.pause_handle()
+    }
+    fn start(&mut self) -> anyhow::Result<()> {
+        self.start()
     }
 }
 
@@ -105,6 +157,7 @@ pub fn unpair_addr(addr: u64) -> Result<(), String> {
 /// Parse a canonical `AA:BB:CC:DD:EE:FF` MAC into the `u64` LSB-first
 /// representation used by the platform Bluetooth APIs. Returns `None`
 /// for anything that doesn't look like a colon-separated 6-byte MAC.
+#[must_use]
 pub fn mac_to_u64(mac: &str) -> Option<u64> {
     let parts: Vec<&str> = mac.split(':').collect();
     if parts.len() != 6 {

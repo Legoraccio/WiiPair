@@ -6,6 +6,7 @@
 //! - **macOS**: CGEvent keyboard mapping fallback — modern macOS
 //!   requires a signed DriverKit driver for a real virtual gamepad.
 
+mod mapping;
 mod profile;
 
 #[cfg(target_os = "linux")]
@@ -13,7 +14,7 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 
-pub use profile::MappingProfile;
+pub use profile::{MappingProfile, PadLayout};
 
 use wiimote_core::{Accelerometer, Buttons, ExtensionData, IrDots};
 
@@ -116,19 +117,12 @@ pub fn output_for_profile(profile: MappingProfile) -> anyhow::Result<Box<dyn Out
 
 #[cfg(windows)]
 pub mod windows {
-    use super::{ControllerState, MappingProfile, Output};
+    use super::{ControllerState, MappingProfile, Output, PadLayout};
+    use crate::mapping::{tilt_to_stick, whammy_to_axis};
     use vigem_client::{Client, TargetId, XButtons, XGamepad, Xbox360Wired};
     use wiimote_core::{
         Buttons, ClassicButtons, ClassicState, ExtensionData, GuitarButtons, GuitarState,
     };
-
-    /// Wiimote accelerometer is centred near 512 on X/Y when held flat
-    /// (Z offset by gravity, ~612). Within ±DEADZONE of 512 we treat
-    /// the stick as neutral.
-    const ACCEL_CENTER: i32 = 512;
-    const ACCEL_DEADZONE: i32 = 30;
-    /// Approximate deflection at 45° of tilt — full stick at that angle.
-    const ACCEL_RANGE: i32 = 220;
 
     pub struct ViGEmOutput {
         target: Xbox360Wired<Client>,
@@ -157,34 +151,20 @@ pub mod windows {
 
     impl Output for ViGEmOutput {
         fn update(&mut self, state: &ControllerState) -> anyhow::Result<()> {
-            let gamepad = match self.profile {
-                MappingProfile::Auto => match &state.ext {
-                    Some(ExtensionData::Guitar(g)) => guitar_gamepad(g, state),
-                    Some(ExtensionData::Classic(c)) => classic_gamepad(c, state),
-                    _ => wiimote_gamepad(state),
-                },
-                MappingProfile::WiimoteXbox => wiimote_gamepad(state),
-                MappingProfile::GuitarXplorer => match &state.ext {
+            let gamepad = match self.profile.resolve_pad(state.ext.as_ref()) {
+                PadLayout::Wiimote => wiimote_gamepad(state),
+                PadLayout::Guitar => match &state.ext {
                     Some(ExtensionData::Guitar(g)) => guitar_gamepad(g, state),
                     _ => wiimote_gamepad(state),
                 },
-                MappingProfile::DrumsXplorer => match &state.ext {
+                PadLayout::Drums => match &state.ext {
                     Some(ExtensionData::Drums(d)) => drums_gamepad(d, state),
                     _ => wiimote_gamepad(state),
                 },
-                MappingProfile::ClassicXbox => match &state.ext {
+                PadLayout::Classic => match &state.ext {
                     Some(ExtensionData::Classic(c)) => classic_gamepad(c, state),
                     _ => wiimote_gamepad(state),
                 },
-                // Keyboard profiles aren't applicable on Windows + ViGEm —
-                // fall back to the auto-pad mapping so the pad is still
-                // useful.
-                MappingProfile::WiimoteKeyboard | MappingProfile::GuitarKeyboard => {
-                    match &state.ext {
-                        Some(ExtensionData::Guitar(g)) => guitar_gamepad(g, state),
-                        _ => wiimote_gamepad(state),
-                    }
-                }
             };
             self.target
                 .update(&gamepad)
@@ -289,8 +269,8 @@ pub mod windows {
         }
         XGamepad {
             buttons: XButtons { raw },
-            thumb_lx: tilt_to_stick(state.accel.x as i32),
-            thumb_ly: tilt_to_stick(state.accel.y as i32),
+            thumb_lx: tilt_to_stick(i32::from(state.accel.x)),
+            thumb_ly: tilt_to_stick(i32::from(state.accel.y)),
             thumb_rx: 0,
             thumb_ry: 0,
             left_trigger: 0,
@@ -339,27 +319,4 @@ pub mod windows {
         }
     }
 
-    fn whammy_to_axis(w: u8) -> i16 {
-        // 5-bit range 0..=31 maps to the full i16 axis range.
-        // w.min(31) keeps the formula safe even if the parser ever lets
-        // a stray bit through; without it the result is still in range
-        // mathematically, the .min() just makes the bound explicit.
-        let w = w.min(31) as i32;
-        (w * 65535 / 31 - 32768) as i16
-    }
-
-    fn tilt_to_stick(raw_axis: i32) -> i16 {
-        let delta = raw_axis - ACCEL_CENTER;
-        if delta.abs() < ACCEL_DEADZONE {
-            return 0;
-        }
-        let signed = if delta > 0 {
-            delta - ACCEL_DEADZONE
-        } else {
-            delta + ACCEL_DEADZONE
-        };
-        let span = (ACCEL_RANGE - ACCEL_DEADZONE).max(1);
-        let scaled = (signed * i16::MAX as i32) / span;
-        scaled.clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16
-    }
 }

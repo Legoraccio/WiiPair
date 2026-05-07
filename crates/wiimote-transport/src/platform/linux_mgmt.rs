@@ -29,6 +29,7 @@
 use crate::platform::ScannerEvent;
 use crossbeam_channel::Sender;
 use std::collections::HashSet;
+use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -43,7 +44,10 @@ const MGMT_EV_PIN_CODE_REQUEST: u16 = 0x000E;
 const MGMT_OP_PIN_CODE_REPLY: u16 = 0x0016;
 
 const BDADDR_BREDR: u8 = 0;
-const PIN_LEN: usize = 6;
+const PIN_LEN: u8 = 6;
+/// Length of `pin_code` in `mgmt_cp_pin_code_reply`: a fixed 16-byte
+/// buffer regardless of `pin_len`, per `linux/include/net/bluetooth/mgmt.h`.
+const MGMT_PIN_BUFFER_LEN: usize = 16;
 
 /// MAC address in little-endian (wire) order — the same representation
 /// the kernel uses in mgmt event payloads. The Wiimote's expected PIN
@@ -76,7 +80,32 @@ struct SockaddrHci {
     hci_channel: u16,
 }
 
+/// `struct mgmt_addr_info` from `linux/include/net/bluetooth/mgmt.h`.
+/// Wire-encoded BD address followed by an address-type byte. Used only
+/// via `size_of` to assert the expected wire size; we serialise fields
+/// individually in [`send_pin_reply`].
+#[repr(C, packed)]
+#[allow(dead_code)]
+struct MgmtAddrInfo {
+    bdaddr: [u8; 6],
+    addr_type: u8,
+}
+
+/// `struct mgmt_cp_pin_code_reply` from
+/// `linux/include/net/bluetooth/mgmt.h`. Sent after the 6-byte
+/// `mgmt_hdr` to answer `MGMT_EV_PIN_CODE_REQUEST`. Used only via
+/// `size_of` for layout assertions; serialisation is manual.
+#[repr(C, packed)]
+#[allow(dead_code)]
+struct MgmtCpPinCodeReply {
+    addr: MgmtAddrInfo,
+    pin_len: u8,
+    pin_code: [u8; MGMT_PIN_BUFFER_LEN],
+}
+
 fn open_mgmt_socket() -> std::io::Result<OwnedFd> {
+    // SAFETY: `libc::socket` takes integer constants and writes no
+    // memory; failure is signalled by a negative return.
     let raw = unsafe {
         libc::socket(
             AF_BLUETOOTH,
@@ -87,17 +116,22 @@ fn open_mgmt_socket() -> std::io::Result<OwnedFd> {
     if raw < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: `raw` is a fresh, owned, non-negative fd we got from
+    // `socket()` and have not yet handed to anything else.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     let addr = SockaddrHci {
         sa_family: AF_BLUETOOTH as u16,
         hci_dev: HCI_DEV_NONE,
         hci_channel: HCI_CHANNEL_CONTROL,
     };
+    // SAFETY: `addr` is fully initialised on the stack and lives across
+    // the call; the cast pointer is valid for `size_of::<SockaddrHci>()`
+    // bytes; `fd.as_raw_fd()` is a valid socket fd we just opened.
     let r = unsafe {
         libc::bind(
             fd.as_raw_fd(),
-            &addr as *const _ as *const libc::sockaddr,
-            std::mem::size_of::<SockaddrHci>() as libc::socklen_t,
+            (&addr as *const SockaddrHci).cast::<libc::sockaddr>(),
+            size_of::<SockaddrHci>() as libc::socklen_t,
         )
     };
     if r < 0 {
@@ -138,10 +172,13 @@ fn run(active: ActiveSet, events: Sender<ScannerEvent>) {
 
     let mut buf = [0u8; 1024];
     loop {
+        // SAFETY: `fd` is a live mgmt socket; `buf` is a fully-owned
+        // stack array and we pass `buf.len()` as the bound, so the
+        // kernel can write at most that many bytes into it.
         let n = unsafe {
             libc::read(
                 fd.as_raw_fd(),
-                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.as_mut_ptr().cast::<libc::c_void>(),
                 buf.len(),
             )
         };
@@ -191,24 +228,40 @@ fn run(active: ActiveSet, events: Sender<ScannerEvent>) {
 }
 
 fn send_pin_reply(fd: &OwnedFd, index: u16, wire_addr: WireAddr) -> std::io::Result<()> {
-    // mgmt_hdr (6) + mgmt_addr_info (7) + pin_len (1) + pin_code (16)
-    let mut reply = [0u8; 30];
+    // Layout: 6-byte mgmt_hdr (opcode + index + payload_len) followed
+    // by `MgmtCpPinCodeReply`. Manual serialisation keeps the unsafe
+    // surface tiny, while `size_of` of the structs above guarantees
+    // the byte counts can't drift if the kernel ever adds fields.
+    const HDR_LEN: usize = 6;
+    const ADDR_LEN: usize = size_of::<MgmtAddrInfo>();
+    const CP_LEN: usize = size_of::<MgmtCpPinCodeReply>();
+    const TOTAL_LEN: usize = HDR_LEN + CP_LEN;
+    // Compile-time assertion: the packed structs have the exact wire
+    // sizes the kernel ABI expects.
+    const _: () = assert!(ADDR_LEN == 7);
+    const _: () = assert!(CP_LEN == 7 + 1 + MGMT_PIN_BUFFER_LEN);
+
+    let mut reply = [0u8; TOTAL_LEN];
+    // mgmt_hdr
     reply[0..2].copy_from_slice(&MGMT_OP_PIN_CODE_REPLY.to_le_bytes());
     reply[2..4].copy_from_slice(&index.to_le_bytes());
-    let cp_len: u16 = (7 + 1 + 16) as u16;
-    reply[4..6].copy_from_slice(&cp_len.to_le_bytes());
+    reply[4..6].copy_from_slice(&(CP_LEN as u16).to_le_bytes());
     // mgmt_addr_info
-    reply[6..12].copy_from_slice(&wire_addr);
-    reply[12] = BDADDR_BREDR;
+    reply[HDR_LEN..HDR_LEN + 6].copy_from_slice(&wire_addr);
+    reply[HDR_LEN + 6] = BDADDR_BREDR;
     // pin_len
-    reply[13] = PIN_LEN as u8;
+    reply[HDR_LEN + ADDR_LEN] = PIN_LEN;
     // pin_code: first 6 bytes are the wire-form BD address; rest stay 0.
-    reply[14..20].copy_from_slice(&wire_addr);
+    let pin_off = HDR_LEN + ADDR_LEN + 1;
+    reply[pin_off..pin_off + 6].copy_from_slice(&wire_addr);
 
+    // SAFETY: `reply` is a fully-initialised stack array of TOTAL_LEN
+    // bytes; `fd` is a live mgmt socket. The length we pass matches
+    // the array length.
     let written = unsafe {
         libc::write(
             fd.as_raw_fd(),
-            reply.as_ptr() as *const libc::c_void,
+            reply.as_ptr().cast::<libc::c_void>(),
             reply.len(),
         )
     };

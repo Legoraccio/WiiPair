@@ -3557,6 +3557,7 @@ name = "wiimote-core"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.11.1",
+ "serde",
  "thiserror 2.0.18",
 ]
 

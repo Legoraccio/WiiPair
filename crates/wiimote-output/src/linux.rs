@@ -21,7 +21,8 @@ use evdev::{
     UinputAbsSetup,
 };
 
-use crate::profile::MappingProfile;
+use crate::mapping::{tilt_to_stick, whammy_to_axis};
+use crate::profile::{MappingProfile, PadLayout};
 use crate::{ControllerState, Output};
 use wiimote_core::{
     Buttons, ClassicButtons, ClassicState, DrumsButtons, DrumsState, ExtensionData, GuitarButtons,
@@ -34,9 +35,6 @@ const XBOX360_PID: u16 = 0x028E;
 
 const ABS_RANGE: i32 = 32767;
 const TRIGGER_MAX: i32 = 255;
-const ACCEL_CENTER: i32 = 512;
-const ACCEL_DEADZONE: i32 = 30;
-const ACCEL_RANGE: i32 = 220;
 
 pub struct UinputOutput {
     device: evdev::uinput::VirtualDevice,
@@ -183,37 +181,20 @@ impl Frame {
 }
 
 fn build_frame(profile: MappingProfile, state: &ControllerState) -> Frame {
-    let pick_layout = || -> MappingProfile {
-        match profile {
-            MappingProfile::Auto => match &state.ext {
-                Some(ExtensionData::Guitar(_)) => MappingProfile::GuitarXplorer,
-                Some(ExtensionData::Drums(_)) => MappingProfile::DrumsXplorer,
-                Some(ExtensionData::Classic(_)) => MappingProfile::ClassicXbox,
-                _ => MappingProfile::WiimoteXbox,
-            },
-            // Keyboard profiles aren't applicable on Linux — fall back
-            // to the gamepad mapping that best matches the extension.
-            MappingProfile::WiimoteKeyboard => MappingProfile::WiimoteXbox,
-            MappingProfile::GuitarKeyboard => MappingProfile::GuitarXplorer,
-            other => other,
-        }
-    };
-    match pick_layout() {
-        MappingProfile::WiimoteXbox => wiimote_frame(state),
-        MappingProfile::GuitarXplorer => match &state.ext {
+    match profile.resolve_pad(state.ext.as_ref()) {
+        PadLayout::Wiimote => wiimote_frame(state),
+        PadLayout::Guitar => match &state.ext {
             Some(ExtensionData::Guitar(g)) => guitar_frame(g, state),
             _ => wiimote_frame(state),
         },
-        MappingProfile::DrumsXplorer => match &state.ext {
+        PadLayout::Drums => match &state.ext {
             Some(ExtensionData::Drums(d)) => drums_frame(d, state),
             _ => wiimote_frame(state),
         },
-        MappingProfile::ClassicXbox => match &state.ext {
+        PadLayout::Classic => match &state.ext {
             Some(ExtensionData::Classic(c)) => classic_frame(c, state),
             _ => wiimote_frame(state),
         },
-        // Should be unreachable after pick_layout.
-        _ => wiimote_frame(state),
     }
 }
 
@@ -231,8 +212,8 @@ fn wiimote_frame(state: &ControllerState) -> Frame {
         ddown: b.contains(Buttons::DOWN),
         dleft: b.contains(Buttons::LEFT),
         dright: b.contains(Buttons::RIGHT),
-        lx: tilt_to_axis(state.accel.x as i32),
-        ly: tilt_to_axis(state.accel.y as i32),
+        lx: i32::from(tilt_to_stick(i32::from(state.accel.x))),
+        ly: i32::from(tilt_to_stick(i32::from(state.accel.y))),
         ..Default::default()
     }
 }
@@ -249,7 +230,7 @@ fn guitar_frame(g: &GuitarState, state: &ControllerState) -> Frame {
         start: g.buttons.contains(GuitarButtons::PLUS),
         select: g.buttons.contains(GuitarButtons::MINUS),
         guide: state.buttons.contains(Buttons::HOME),
-        rx: whammy_to_axis(g.whammy),
+        rx: i32::from(whammy_to_axis(g.whammy)),
         ..Default::default()
     }
 }
@@ -298,21 +279,3 @@ fn classic_frame(c: &ClassicState, _state: &ControllerState) -> Frame {
     }
 }
 
-fn whammy_to_axis(w: u8) -> i32 {
-    let w = w.min(31) as i32;
-    w * (2 * ABS_RANGE) / 31 - ABS_RANGE
-}
-
-fn tilt_to_axis(raw: i32) -> i32 {
-    let delta = raw - ACCEL_CENTER;
-    if delta.abs() < ACCEL_DEADZONE {
-        return 0;
-    }
-    let signed = if delta > 0 {
-        delta - ACCEL_DEADZONE
-    } else {
-        delta + ACCEL_DEADZONE
-    };
-    let span = (ACCEL_RANGE - ACCEL_DEADZONE).max(1);
-    (signed * ABS_RANGE / span).clamp(-ABS_RANGE, ABS_RANGE)
-}

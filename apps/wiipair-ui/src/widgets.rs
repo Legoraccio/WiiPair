@@ -232,7 +232,7 @@ pub fn whammy_bar(ui: &mut egui::Ui, value: u8) {
     ui.allocate_ui(egui::Vec2::new(120.0, 56.0), |ui| {
         ui.vertical(|ui| {
             ui.add_space(14.0);
-            let pct = (value as f32 / 31.0).clamp(0.0, 1.0);
+            let pct = (f32::from(value) / 31.0).clamp(0.0, 1.0);
             ui.add(
                 egui::ProgressBar::new(pct)
                     .desired_width(110.0)
@@ -278,7 +278,7 @@ pub fn pm_indicator(ui: &mut egui::Ui, plus: bool, minus: bool) {
 /// previous `byte/255*100` formula made fresh batteries look 75% — the
 /// rescale below makes "100 %" actually correspond to a fresh battery.
 fn battery_pct(raw: u8) -> u32 {
-    let pct = (raw as f32 - 51.0) / (192.0 - 51.0) * 100.0;
+    let pct = (f32::from(raw) - 51.0) / (192.0 - 51.0) * 100.0;
     pct.clamp(0.0, 100.0) as u32
 }
 
@@ -325,8 +325,8 @@ pub fn tilt_widget(ui: &mut egui::Ui, accel: wiimote_core::Accelerometer) {
     // The marker's planar position represents tilt: ±220 raw at 45°.
     const CENTER: f32 = 512.0;
     const RANGE: f32 = 220.0;
-    let dx = ((accel.x as f32 - CENTER) / RANGE).clamp(-1.0, 1.0);
-    let dy = ((accel.y as f32 - CENTER) / RANGE).clamp(-1.0, 1.0);
+    let dx = ((f32::from(accel.x) - CENTER) / RANGE).clamp(-1.0, 1.0);
+    let dy = ((f32::from(accel.y) - CENTER) / RANGE).clamp(-1.0, 1.0);
     let marker = egui::Pos2::new(center.x + dx * radius * 0.85, center.y - dy * radius * 0.85);
     painter.circle_filled(marker, 4.0, egui::Color32::from_rgb(180, 220, 255));
     // Crosshair so neutral position is visually obvious.
@@ -375,11 +375,11 @@ pub fn ir_widget(ui: &mut egui::Ui, dots: wiimote_core::IrDots) {
         // Wiimote IR camera reports X 0..=1023 left→right; Y 0..=767
         // top→bottom on the Wii's coordinate system. We mirror X so
         // the on-screen visualization matches what the user sees.
-        let nx = 1.0 - (dot.x as f32 / 1023.0).clamp(0.0, 1.0);
-        let ny = (dot.y as f32 / 767.0).clamp(0.0, 1.0);
+        let nx = 1.0 - (f32::from(dot.x) / 1023.0).clamp(0.0, 1.0);
+        let ny = (f32::from(dot.y) / 767.0).clamp(0.0, 1.0);
         let px = rect.left() + nx * rect.width();
         let py = rect.top() + ny * rect.height();
-        let r = (dot.size.max(1) as f32 * 0.5 + 1.5).min(4.0);
+        let r = (f32::from(dot.size.max(1)) * 0.5 + 1.5).min(4.0);
         painter.circle_filled(egui::Pos2::new(px, py), r, palette[i % 4]);
     }
 }

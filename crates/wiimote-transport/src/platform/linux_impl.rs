@@ -243,28 +243,14 @@ async fn register_agent(
     session.register_agent(agent).await
 }
 
-// Kept around for documentation: this is the wrong-by-design
-// conversion BlueZ's agent path forced us into before we moved PIN
-// replies to the kernel mgmt socket. Bytes >= 0x80 get re-encoded
-// as 2-byte UTF-8 sequences, so the bytes BlueZ wrote to the kernel
-// almost never matched what the Wiimote expected. The real PIN reply
-// now lives in `linux_mgmt::send_pin_reply`.
-#[allow(dead_code)]
-fn pin_for_address(addr: Address) -> String {
-    let bytes = addr.0;
-    // BlueZ Address is MSB-first; the Wiimote wants LSB-first wire
-    // order. Reverse and pass bytes raw — `String::from_utf8_lossy`
-    // would mangle the high-bit bytes; we use `as_bytes` casts on the
-    // receiving side. Build via from_utf8_unchecked equivalent: the
-    // bluer agent API takes `String`, so we can't avoid the round-
-    // trip. Many Wiimotes accept the UTF-8 lossy form too, but for
-    // strict accuracy we encode bytes 1:1 into the surrogate range.
-    let mut s = String::with_capacity(6);
-    for b in bytes.iter().rev() {
-        s.push(*b as char);
-    }
-    s
-}
+// Historical note (kept for posterity): an earlier implementation
+// generated the PIN as a `String` by reversing the BD_ADDR bytes and
+// casting each byte via `as char`. That approach was forced by BlueZ's
+// agent API, which only accepts `String`, but bytes >= 0x80 got
+// re-encoded as 2-byte UTF-8 sequences and almost never matched what
+// the Wiimote expected. PIN replies now live in
+// `linux_mgmt::send_pin_reply`, which writes raw bytes to the kernel
+// mgmt socket and bypasses the BlueZ agent layer entirely.
 
 async fn inquiry_round(
     adapter: &Adapter,
@@ -444,20 +430,19 @@ fn address_to_u64(a: Address) -> u64 {
     // BlueZ stores BD address MSB-first in `[u8; 6]`. The daemon and
     // Win32 backend both speak LSB-first u64 — mirror so cross-OS
     // logs read the same.
-    let mut bytes = [0u8; 8];
-    for (i, b) in a.0.iter().rev().enumerate() {
-        bytes[i] = *b;
-    }
-    u64::from_le_bytes(bytes)
+    let mut le = [0u8; 8];
+    let mut msb = a.0;
+    msb.reverse();
+    le[..6].copy_from_slice(&msb);
+    u64::from_le_bytes(le)
 }
 
 fn u64_to_address(addr: u64) -> Address {
-    let bytes = addr.to_le_bytes();
-    let mut out = [0u8; 6];
-    for (i, b) in bytes.iter().take(6).rev().enumerate() {
-        out[i] = *b;
-    }
-    Address::new(out)
+    let le = addr.to_le_bytes();
+    let mut msb = [0u8; 6];
+    msb.copy_from_slice(&le[..6]);
+    msb.reverse();
+    Address::new(msb)
 }
 
 fn address_short(a: Address) -> String {
