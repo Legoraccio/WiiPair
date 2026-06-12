@@ -21,6 +21,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Decode the PNG icon at runtime for `with_icon`. We deliberately keep
 # only PNG decoding to avoid pulling in jpeg/webp/etc.
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Rasterize the bundled controller SVG sprites for the Xbox-360
+# mapping preview. Text/font features are disabled — none of the
+# assets use `<text>` so we save ~700 KB of fontkit/system-fonts
+# code from the release binary.
+resvg = { version = "0.43", default-features = false }
+usvg = { version = "0.43", default-features = false }
+tiny-skia = "0.11"
 
 [build-dependencies]
 # Generate `icon.ico` in OUT_DIR from `assets/icon.png` so the

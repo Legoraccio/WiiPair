@@ -18,6 +18,8 @@
 
 use bitflags::bitflags;
 
+use crate::report::Accelerometer;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ExtensionType {
@@ -40,22 +42,55 @@ pub enum ExtensionType {
 
 impl ExtensionType {
     /// Map a 6-byte plain (post-0x55-init) extension ID to a known type.
+    ///
+    /// The Wii extension-ID layout is:
+    /// ```text
+    /// id[0..2]  device-specific (often 0x00..0x00, but real units —
+    ///           especially clones, post-MotionPlus passthrough, or
+    ///           freshly-reset Nunchuks — surface 0xFF or other bytes
+    ///           here). Used only as a *secondary* discriminator for
+    ///           variants that share the same id[2..6] (Classic vs
+    ///           Classic Pro, Guitar vs Drums vs DJ Hero turntable).
+    /// id[2..4]  always 0xa4 0x20 on a genuine Nintendo / GH/RB
+    ///           extension — the family marker.
+    /// id[4..6]  the actual model identifier (Nunchuk, Classic, …).
+    /// ```
+    /// Matching only on `id[2..6]` for the model and leaving `id[0]`
+    /// as a soft discriminator is what lets us recognise a Nunchuk
+    /// whose first byte is `0xFF` (real-world hardware reports this
+    /// after some power-cycle paths) instead of dumping it as
+    /// `Unknown`.
     #[must_use]
     pub fn from_id(id: &[u8; 6]) -> Self {
-        match id {
-            [0x00, 0x00, 0xa4, 0x20, 0x00, 0x00] => Self::Nunchuk,
-            [0x00, 0x00, 0xa4, 0x20, 0x00, 0x01] => Self::Nunchuk,
-            [0x00, 0x00, 0xa4, 0x20, 0x01, 0x01] => Self::ClassicController,
-            [0x01, 0x00, 0xa4, 0x20, 0x01, 0x01] => Self::ClassicControllerPro,
-            [0x00, 0x00, 0xa4, 0x20, 0x01, 0x03] => Self::Guitar,
-            [0x01, 0x00, 0xa4, 0x20, 0x01, 0x03] => Self::Drums,
-            [0x03, 0x00, 0xa4, 0x20, 0x01, 0x03] => Self::DjHeroTurntable,
-            [0x00, 0x00, 0xa4, 0x20, 0x04, 0x05] => Self::MotionPlus,
-            [0x00, 0x00, 0xa4, 0x20, 0x05, 0x05] => Self::MotionPlus,
-            [0x00, 0x00, 0xa4, 0x20, 0x07, 0x05] => Self::MotionPlus,
-            [0x00, 0x00, 0xa4, 0x20, 0x04, 0x04] => Self::UDrawTablet,
-            [0x00, 0x00, 0xa4, 0x20, 0x01, 0x11] => Self::TaikoDrum,
-            other => Self::Unknown(*other),
+        // Only Nintendo / GH/RB extensions ever set this family
+        // marker. Anything else really is unknown.
+        if id[2] != 0xa4 || id[3] != 0x20 {
+            return Self::Unknown(*id);
+        }
+        match (id[4], id[5]) {
+            // Plain Nunchuk; id[5] varies across batches (0x00 vs 0x01).
+            (0x00, 0x00 | 0x01) => Self::Nunchuk,
+            // Classic Controller family — Pro variant signalled by
+            // id[0] = 0x01.
+            (0x01, 0x01) => {
+                if id[0] == 0x01 {
+                    Self::ClassicControllerPro
+                } else {
+                    Self::ClassicController
+                }
+            }
+            // Guitar / Drums / DJ Hero turntable share id[4..6] =
+            // 0x01 0x03 and disambiguate via id[0].
+            (0x01, 0x03) => match id[0] {
+                0x01 => Self::Drums,
+                0x03 => Self::DjHeroTurntable,
+                _ => Self::Guitar,
+            },
+            // Wii Motion Plus and its passthrough modes.
+            (0x04 | 0x05 | 0x07, 0x05) => Self::MotionPlus,
+            (0x04, 0x04) => Self::UDrawTablet,
+            (0x01, 0x11) => Self::TaikoDrum,
+            _ => Self::Unknown(*id),
         }
     }
 
@@ -128,10 +163,31 @@ impl ExtensionData {
 
 // --- Nunchuk ----------------------------------------------------------
 
+/// Nunchuk live state.
+///
+/// Per WiiBrew the 6-byte Nunchuk payload is:
+/// ```text
+/// Byte 0: SX            stick X, 0..=255 (~128 neutral)
+/// Byte 1: SY            stick Y, 0..=255 (~128 neutral)
+/// Byte 2: AX<9:2>       accel X, high 8 bits
+/// Byte 3: AY<9:2>       accel Y, high 8 bits
+/// Byte 4: AZ<9:2>       accel Z, high 8 bits
+/// Byte 5:
+///   bit 7-6: AZ<1:0>    accel Z, low 2 bits
+///   bit 5-4: AY<1:0>    accel Y, low 2 bits
+///   bit 3-2: AX<1:0>    accel X, low 2 bits
+///   bit 1:   BC         C button   (0 = pressed, 1 = released)
+///   bit 0:   BZ         Z button   (0 = pressed, 1 = released)
+/// ```
+/// Stick rests around (128, 128); accel rests around (512, 512, 612)
+/// when held with the Z button facing up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NunchukState {
     pub stick_x: u8,
     pub stick_y: u8,
+    /// 10-bit raw accelerometer (X, Y, Z). Reconstructed from the
+    /// 8 high bits in bytes 2-4 plus the 2 low bits packed in byte 5.
+    pub accel: Accelerometer,
     pub c: bool,
     pub z: bool,
 }
@@ -139,10 +195,16 @@ pub struct NunchukState {
 impl NunchukState {
     #[must_use]
     pub fn parse(b: &[u8; 16]) -> Self {
-        // Buttons live in byte 5, inverted (1 = released).
+        // Reconstruct each 10-bit accel axis from the high 8 bits in
+        // bytes 2-4 and the 2 low bits packed in byte 5.
+        let ax = (u16::from(b[2]) << 2) | u16::from((b[5] >> 2) & 0x03);
+        let ay = (u16::from(b[3]) << 2) | u16::from((b[5] >> 4) & 0x03);
+        let az = (u16::from(b[4]) << 2) | u16::from((b[5] >> 6) & 0x03);
         Self {
             stick_x: b[0],
             stick_y: b[1],
+            accel: Accelerometer { x: ax, y: ay, z: az },
+            // Buttons live in byte 5, inverted (1 = released).
             c: (b[5] & 0x02) == 0,
             z: (b[5] & 0x01) == 0,
         }
@@ -374,6 +436,44 @@ mod tests {
         assert_eq!(ExtensionType::from_id(&id), ExtensionType::Unknown(id));
     }
 
+    #[test]
+    fn nunchuk_first_byte_variants_still_classify() {
+        // Real-world ID seen on Nunchuks after some power-cycle paths
+        // (and on a few clones): id[0] = 0xFF instead of 0x00. The
+        // family marker (id[2..4] = 0xa4 0x20) plus the model bytes
+        // (id[4..6] = 0x00 0x00) are what actually identify it.
+        assert_eq!(
+            ExtensionType::from_id(&[0xff, 0x00, 0xa4, 0x20, 0x00, 0x00]),
+            ExtensionType::Nunchuk,
+        );
+        assert_eq!(
+            ExtensionType::from_id(&[0xff, 0xff, 0xa4, 0x20, 0x00, 0x01]),
+            ExtensionType::Nunchuk,
+        );
+    }
+
+    #[test]
+    fn classic_pro_distinguished_by_first_byte() {
+        // id[4..6] = 0x01 0x01 — Classic Controller. id[0] = 0x01
+        // bumps it to the Pro variant; anything else stays Classic.
+        assert_eq!(
+            ExtensionType::from_id(&[0x00, 0x00, 0xa4, 0x20, 0x01, 0x01]),
+            ExtensionType::ClassicController,
+        );
+        assert_eq!(
+            ExtensionType::from_id(&[0x01, 0x00, 0xa4, 0x20, 0x01, 0x01]),
+            ExtensionType::ClassicControllerPro,
+        );
+    }
+
+    #[test]
+    fn non_nintendo_family_marker_is_unknown() {
+        // Without 0xa4 0x20 in id[2..4] we can't be sure of the
+        // protocol; safer to surface as Unknown than guess.
+        let id = [0x00, 0x00, 0x12, 0x34, 0x00, 0x00];
+        assert_eq!(ExtensionType::from_id(&id), ExtensionType::Unknown(id));
+    }
+
     fn ext_buf(byte4: u8, byte5: u8) -> [u8; 16] {
         let mut buf = [0u8; 16];
         buf[4] = byte4;
@@ -392,6 +492,48 @@ mod tests {
         let s = NunchukState::parse(&buf);
         assert!(s.c);
         assert!(s.z);
+    }
+
+    #[test]
+    fn nunchuk_accel_reconstructs_10_bits() {
+        // Synthetic frame: stick neutral, accel ≈ (512, 512, 612), no buttons.
+        // Encoded as: AX<9:2>=128 (=0x80), AY<9:2>=128 (=0x80), AZ<9:2>=153 (=0x99).
+        // Low bits packed in byte 5: AZ<1:0>=00, AY<1:0>=00, AX<1:0>=00.
+        // Buttons released → bits 1+0 = 11.
+        let mut b = [0u8; 16];
+        b[0] = 128; // stick X neutral
+        b[1] = 128; // stick Y neutral
+        b[2] = 0x80; // AX high
+        b[3] = 0x80; // AY high
+        b[4] = 0x99; // AZ high (153 << 2 = 612)
+        b[5] = 0b0000_0011; // no extra accel low bits, both buttons released
+        let s = NunchukState::parse(&b);
+        assert_eq!(s.accel.x, 512);
+        assert_eq!(s.accel.y, 512);
+        assert_eq!(s.accel.z, 612);
+        assert!(!s.c);
+        assert!(!s.z);
+        assert_eq!(s.stick_x, 128);
+        assert_eq!(s.stick_y, 128);
+    }
+
+    #[test]
+    fn nunchuk_accel_low_bits_packed_in_byte5() {
+        // Verify each axis pair correctly steals its low 2 bits from
+        // the right slice of byte 5.
+        let mut b = [0u8; 16];
+        b[2] = 0xFF;
+        b[3] = 0xFF;
+        b[4] = 0xFF;
+        // bits 7-6 = AZ low, bits 5-4 = AY low, bits 3-2 = AX low.
+        // Set AX<1:0> = 11, AY<1:0> = 10, AZ<1:0> = 01.
+        b[5] = 0b01_10_11_11;
+        let s = NunchukState::parse(&b);
+        // High 8 bits = 0xFF = 255; low 2 bits make the lower nibble.
+        // 255 << 2 = 1020; +3 = 1023, +2 = 1022, +1 = 1021.
+        assert_eq!(s.accel.x, 1023);
+        assert_eq!(s.accel.y, 1022);
+        assert_eq!(s.accel.z, 1021);
     }
 
     #[test]

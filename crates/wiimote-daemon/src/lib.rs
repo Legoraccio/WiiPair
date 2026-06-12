@@ -21,8 +21,10 @@ mod state;
 mod ticks;
 mod transport;
 pub mod ui_log;
+pub mod user_msg;
 
 pub use ui_log::{UiLogLayer, install_ui_log_sender};
+pub use user_msg::UserFacingError;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use std::collections::{HashMap, HashSet};
@@ -103,6 +105,46 @@ pub enum UiEvent {
     /// time — Windows' BT stack is likely stuck. The UI uses this to
     /// pop a recovery-instructions dialog.
     PairingStuck { addr: u64 },
+    /// A user-facing failure that should appear as a dismissible
+    /// banner in the UI — distinct from `Log` because the UI keeps
+    /// it visible after the original log line has scrolled off.
+    PersistentWarning(UserFacingError),
+    /// The condition that produced an earlier `PersistentWarning`
+    /// has cleared — the UI should remove any banner whose
+    /// `UserFacingError::dedup_key()` matches this string. Banners
+    /// that the user already dismissed manually are unaffected.
+    PersistentWarningResolved(&'static str),
+}
+
+/// Tell the UI that the condition behind a previously-emitted
+/// `PersistentWarning` (with this `dedup_key()`) has cleared, so the
+/// banner can disappear. No-op on the UI side if no such banner is
+/// active — keeping the call sites safe to fire opportunistically.
+pub(crate) fn clear_persistent_warning(events_tx: &Sender<UiEvent>, key: &'static str) {
+    let _ = events_tx.send(UiEvent::PersistentWarningResolved(key));
+}
+
+/// Emit a user-facing error as a persistent banner *and* log a raw
+/// detail line below it — the UI keeps the banner visible while the
+/// log scrolls; the log entry is where users go for the technical
+/// detail. Both are sent on the same channel; `_ = send(…)` because a
+/// disconnected channel just means the UI is gone.
+pub(crate) fn emit_user_error(
+    events_tx: &Sender<UiEvent>,
+    err: UserFacingError,
+    log_detail: impl Into<String>,
+) {
+    let detail = log_detail.into();
+    let _ = events_tx.send(UiEvent::PersistentWarning(err.clone()));
+    let level = match err {
+        // `OutputBackendUnsupported` and `SlotCapReached` are user
+        // configuration issues, not failures — Warn is enough.
+        UserFacingError::OutputBackendUnsupported | UserFacingError::SlotCapReached => {
+            LogLevel::Warn
+        }
+        _ => LogLevel::Error,
+    };
+    let _ = events_tx.send(log_event(level, detail));
 }
 
 fn log_event(level: LogLevel, message: impl Into<String>) -> UiEvent {
@@ -194,10 +236,11 @@ impl Daemon {
             .name("wiimote-daemon".into())
             .spawn(move || {
                 if let Err(e) = run(events_tx_thread.clone(), commands_rx) {
-                    let _ = events_tx_thread.send(log_event(
-                        LogLevel::Error,
+                    emit_user_error(
+                        &events_tx_thread,
+                        UserFacingError::DaemonStopped,
                         format!("daemon stopped: {e}"),
-                    ));
+                    );
                 }
             })?;
 
@@ -287,10 +330,11 @@ fn run(events_tx: Sender<UiEvent>, commands_rx: Receiver<UiCommand>) -> anyhow::
     let scan_pause = scanner.pause_handle();
     if let Err(e) = scanner.start() {
         warn!("bluetooth scanner not available: {e}");
-        let _ = events_tx.send(log_event(
-            LogLevel::Warn,
+        emit_user_error(
+            &events_tx,
+            UserFacingError::BluetoothScannerUnavailable,
             format!("scanner disabled: {e}"),
-        ));
+        );
     }
 
     let mut ctx = DaemonCtx::new();

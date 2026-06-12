@@ -7,18 +7,25 @@
 #[cfg(target_os = "linux")]
 mod cap_self_grant;
 mod device_card;
+mod device_widgets;
 mod dialogs;
 mod icon;
 mod icons;
+mod menubar;
 mod widgets;
+mod xbox_widget;
 
 use chrono::{DateTime, Local};
 use eframe::egui;
 use std::collections::VecDeque;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use wiimote_daemon::{Daemon, DeviceSnapshot, LogLevel, UiCommand, UiEvent, UiLogLayer};
+use wiimote_daemon::{
+    Daemon, DeviceSnapshot, LogLevel, UiCommand, UiEvent, UiLogLayer, UserFacingError,
+};
 use wiimote_output::{ProbeFailure, probe_default};
+
+use crate::menubar::MenuAction;
 
 fn main() -> eframe::Result {
     // Wiimote pairing's PIN reply runs on the kernel mgmt socket
@@ -49,14 +56,10 @@ fn main() -> eframe::Result {
             // Fatal: nothing the UI can do without a running daemon.
             // On Windows release the console is hidden, so a plain
             // panic produces a silent crash. Show a dedicated error
-            // window with the failure detail and a Close button.
+            // window with the user-friendly explanation and the raw
+            // detail tucked into a collapsing "Technical details".
             eprintln!("daemon failed to start: {e}");
-            return show_fatal_error(format!(
-                "Could not start the WiiPair daemon:\n\n{e}\n\n\
-                 This usually means a Bluetooth radio could not be \
-                 initialised. Check that your BT adapter is enabled and \
-                 try again."
-            ));
+            return show_fatal_error(format!("{e}"));
         }
     };
     // Wire the layer's sink up now that the daemon has created its
@@ -75,8 +78,8 @@ fn main() -> eframe::Result {
     // 640x420 minimum let the user shrink the window to a state where
     // widgets clipped through one another.
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([960.0, 640.0])
-        .with_min_inner_size([820.0, 540.0])
+        .with_inner_size([960.0, 660.0])
+        .with_min_inner_size([820.0, 560.0])
         .with_title("WiiPair");
     if let Some(icon) = icon::load() {
         viewport = viewport.with_icon(icon);
@@ -98,33 +101,44 @@ fn main() -> eframe::Result {
 /// builds the console is hidden — a plain panic yields a silent
 /// crash, which is why we go through the trouble of standing up a
 /// dedicated egui surface just for this case.
-fn show_fatal_error(message: String) -> eframe::Result {
+fn show_fatal_error(detail: String) -> eframe::Result {
     let viewport = egui::ViewportBuilder::default()
-        .with_inner_size([540.0, 260.0])
-        .with_min_inner_size([420.0, 200.0])
-        .with_title("WiiPair — fatal error");
+        .with_inner_size([540.0, 320.0])
+        .with_min_inner_size([460.0, 260.0])
+        .with_title("WiiPair — couldn't start");
     let opts = eframe::NativeOptions {
         viewport,
         ..Default::default()
     };
     eframe::run_native(
-        "WiiPair — fatal error",
+        "WiiPair — couldn't start",
         opts,
-        Box::new(move |_cc| Ok(Box::new(FatalErrorApp { message }))),
+        Box::new(move |_cc| Ok(Box::new(FatalErrorApp { detail }))),
     )
 }
 
 struct FatalErrorApp {
-    message: String,
+    /// Raw error message — shown only inside the collapsible
+    /// "Technical details" so the main copy stays user-facing.
+    detail: String,
 }
 
 impl eframe::App for FatalErrorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(8.0);
+            ui.add_space(10.0);
             ui.heading("WiiPair couldn't start");
             ui.add_space(8.0);
-            ui.label(&self.message);
+            ui.label(UserFacingError::DaemonStartFailed.message());
+            ui.add_space(10.0);
+            ui.collapsing("Technical details", |ui| {
+                ui.label(
+                    egui::RichText::new(&self.detail)
+                        .monospace()
+                        .small()
+                        .weak(),
+                );
+            });
             ui.add_space(16.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Close").clicked() {
@@ -166,11 +180,19 @@ impl LogFilter {
     }
 }
 
+/// One persistent banner shown above the device list. `key` is the
+/// `UserFacingError`'s dedup key so a flapping daemon doesn't stack
+/// multiple copies of the same warning.
+struct PersistentWarning {
+    key: &'static str,
+    message: String,
+}
+
 /// Bundles the state of every modal/dialog the UI can show. Pulling
 /// these out of `App` keeps the App struct focused on data + plumbing
-/// — the driver probe, pairing-stuck recovery, and forget-confirm
-/// flows are otherwise unrelated to each other and the rest of the
-/// UI doesn't care about them between dialog impressions.
+/// — the driver probe, pairing-stuck recovery, forget-confirm, and
+/// About flows are otherwise unrelated to each other and the rest of
+/// the UI doesn't care about them between dialog impressions.
 #[derive(Default)]
 struct Modals {
     /// `Some(addr)` when the daemon told us a pairing attempt is hung;
@@ -184,6 +206,8 @@ struct Modals {
     /// install-driver dialog.
     driver_probe: Option<ProbeFailure>,
     driver_dialog_dismissed: bool,
+    /// Set when Help → About is clicked.
+    about_open: bool,
 }
 
 struct App {
@@ -191,6 +215,9 @@ struct App {
     devices: Vec<DeviceSnapshot>,
     log: VecDeque<LogLine>,
     log_filter: LogFilter,
+    /// View → Show log panel toggle. Persists for the lifetime of the
+    /// process; defaults to visible.
+    log_visible: bool,
     scan_active_until: Option<std::time::Instant>,
     modals: Modals,
     /// Per-frame channel populated by device cards; drained at the end
@@ -198,10 +225,10 @@ struct App {
     /// confirmation modal while forwarding everything else verbatim.
     card_tx: crossbeam_channel::Sender<UiCommand>,
     card_rx: crossbeam_channel::Receiver<UiCommand>,
-    /// Persistent banner derived from the log: surfaces "scanner
-    /// disabled" / "ViGEmBus unavailable" so the user notices even
-    /// after the original log line has scrolled off (U12).
-    persistent_warnings: Vec<String>,
+    /// Persistent banner derived from `UiEvent::PersistentWarning`.
+    /// Survives log eviction so the user notices even after the
+    /// originating log line has scrolled off (U12).
+    persistent_warnings: Vec<PersistentWarning>,
 }
 
 impl App {
@@ -212,6 +239,10 @@ impl App {
             devices: Vec::new(),
             log: VecDeque::with_capacity(LOG_CAPACITY),
             log_filter: LogFilter::default(),
+            // Hidden by default — the persistent banners surface the
+            // important issues; users open the log via View → Show
+            // log panel only when they need the technical detail.
+            log_visible: false,
             scan_active_until: None,
             modals: Modals {
                 driver_probe,
@@ -228,11 +259,6 @@ impl App {
             match ev {
                 UiEvent::DeviceListChanged(list) => self.devices = list,
                 UiEvent::Log { at, level, message } => {
-                    Self::maybe_set_persistent_warning(
-                        &mut self.persistent_warnings,
-                        level,
-                        &message,
-                    );
                     if self.log.len() >= LOG_CAPACITY {
                         self.log.pop_front();
                     }
@@ -248,7 +274,36 @@ impl App {
                 UiEvent::PairingStuck { addr } => {
                     self.modals.pairing_stuck = Some(addr);
                 }
+                UiEvent::PersistentWarning(err) => {
+                    let key = err.dedup_key();
+                    if !self.persistent_warnings.iter().any(|w| w.key == key) {
+                        self.persistent_warnings.push(PersistentWarning {
+                            key,
+                            message: err.message(),
+                        });
+                    }
+                }
+                UiEvent::PersistentWarningResolved(key) => {
+                    // The condition cleared on the daemon side — drop
+                    // the matching banner (if any). Banners the user
+                    // already dismissed are simply not present, so
+                    // this retain() is a no-op for them.
+                    self.persistent_warnings.retain(|w| w.key != key);
+                }
             }
+        }
+    }
+
+    fn handle_menu_action(&mut self, action: MenuAction, ctx: &egui::Context) {
+        match action {
+            MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            MenuAction::ToggleLog => self.log_visible = !self.log_visible,
+            MenuAction::ClearLog => self.log.clear(),
+            MenuAction::OpenAbout => self.modals.about_open = true,
+            MenuAction::OpenRepo => dialogs::open_url(dialogs::REPO_URL),
+            MenuAction::OpenReleases => dialogs::open_url(dialogs::RELEASES_URL),
+            MenuAction::OpenIssues => dialogs::open_url(dialogs::ISSUES_URL),
+            MenuAction::StartScan => self.daemon.send_command(UiCommand::StartScan),
         }
     }
 }
@@ -257,8 +312,12 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
 
-        self.render_header(ctx);
-        self.render_log_panel(ctx);
+        self.render_menu_bar(ctx);
+        self.render_warning_banners(ctx);
+        self.render_status_bar(ctx);
+        if self.log_visible {
+            self.render_log_panel(ctx);
+        }
         self.render_devices_panel(ctx);
         self.render_modals(ctx);
 
@@ -267,79 +326,109 @@ impl eframe::App for App {
 }
 
 impl App {
-    /// Promote a small set of one-time log warnings into a persistent
-    /// banner — once the BT scanner has died or ViGEmBus is missing,
-    /// the user shouldn't have to scroll back through hundreds of
-    /// lines to find the message.
-    fn maybe_set_persistent_warning(
-        warnings: &mut Vec<String>,
-        level: LogLevel,
-        message: &str,
-    ) {
-        if !matches!(level, LogLevel::Warn | LogLevel::Error) {
-            return;
+    fn render_menu_bar(&mut self, ctx: &egui::Context) {
+        // Compute the scan-window countdown once per frame and hand
+        // it to the menu bar. `Some(N)` while a scan is running,
+        // `None` when idle.
+        let scan_remaining_s = self
+            .scan_active_until
+            .and_then(|t| t.checked_duration_since(std::time::Instant::now()))
+            .map(|d| d.as_secs() + 1);
+        let mut action: Option<MenuAction> = None;
+        egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
+            action = menubar::render(ui, self.log_visible, scan_remaining_s);
+        });
+        if let Some(a) = action {
+            self.handle_menu_action(a, ctx);
         }
-        let triggers: &[&str] = &[
-            "scanner disabled",
-            "Virtual controller output unavailable",
-            "Virtual controller output not implemented",
-            "ViGEmBus",
-        ];
-        if !triggers.iter().any(|t| message.contains(t)) {
-            return;
-        }
-        if warnings.iter().any(|w| w == message) {
-            return;
-        }
-        warnings.push(message.to_string());
     }
 
-    fn render_header(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("header").show(ctx, |ui| {
-            // Persistent warning banner (U12) — survives log eviction.
+    fn render_warning_banners(&mut self, ctx: &egui::Context) {
+        if self.persistent_warnings.is_empty() {
+            return;
+        }
+        // Track which warning the user clicked Dismiss on; mutate
+        // the vec after the show() callback to avoid holding a
+        // borrow while iterating.
+        let mut dismissed_key: Option<&'static str> = None;
+        egui::TopBottomPanel::top("warnings").show(ctx, |ui| {
             for w in &self.persistent_warnings {
                 let frame = egui::Frame::none()
-                    .fill(egui::Color32::from_rgb(60, 30, 30))
-                    .inner_margin(egui::Margin::symmetric(8.0, 4.0));
+                    .fill(egui::Color32::from_rgb(60, 45, 25))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgb(180, 140, 60),
+                    ))
+                    .rounding(egui::Rounding::same(4.0))
+                    .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                    .outer_margin(egui::Margin::symmetric(0.0, 2.0));
                 frame.show(ui, |ui| {
-                    ui.colored_label(egui::Color32::from_rgb(255, 200, 200), w);
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(240, 200, 100),
+                            "⚠",
+                        );
+                        ui.colored_label(
+                            egui::Color32::from_rgb(245, 225, 190),
+                            &w.message,
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui
+                                    .small_button("Dismiss")
+                                    .on_hover_text(
+                                        "Hide this warning. It will reappear if the \
+                                         underlying condition recurs.",
+                                    )
+                                    .clicked()
+                                {
+                                    dismissed_key = Some(w.key);
+                                }
+                            },
+                        );
+                    });
                 });
             }
-            ui.horizontal(|ui| {
-                ui.heading("WiiPair");
+        });
+        if let Some(k) = dismissed_key {
+            self.persistent_warnings.retain(|w| w.key != k);
+        }
+    }
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let now = std::time::Instant::now();
-                    let remaining = self
-                        .scan_active_until
-                        .and_then(|t| t.checked_duration_since(now));
-                    match remaining {
-                        Some(left) => {
-                            let _ = ui.add_enabled(
-                                false,
-                                egui::Button::new(format!(
-                                    "Scanning… {:>2}s",
-                                    left.as_secs() + 1
-                                )),
+    fn render_status_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("statusbar")
+            .frame(
+                egui::Frame::none()
+                    .fill(ctx.style().visuals.faint_bg_color)
+                    .inner_margin(egui::Margin::symmetric(10.0, 4.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let connected = self.devices.iter().filter(|d| d.connected).count();
+                    let known = self.devices.len();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{connected} connected · {known} known"
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "v{}",
+                                    env!("CARGO_PKG_VERSION")
+                                ))
+                                .small()
+                                .weak(),
                             );
-                        }
-                        None => {
-                            if ui
-                                .button("Scan for new devices (30 s)")
-                                .on_hover_text(
-                                    "Open a 30 s window to discover and pair new \
-                                     Wiimotes. Hold 1+2 on the controller while the \
-                                     button is counting down.",
-                                )
-                                .clicked()
-                            {
-                                self.daemon.send_command(UiCommand::StartScan);
-                            }
-                        }
-                    }
+                        },
+                    );
                 });
             });
-        });
     }
 
     fn render_log_panel(&mut self, ctx: &egui::Context) {
@@ -397,14 +486,7 @@ impl App {
     fn render_devices_panel(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.devices.is_empty() {
-                ui.add_space(20.0);
-                ui.vertical_centered(|ui| {
-                    ui.label("No Wiimote known yet.");
-                    ui.label(
-                        "Click 'Scan for new devices' and press 1+2 on the Wiimote, \
-                         or pair manually via your OS Bluetooth settings.",
-                    );
-                });
+                self.render_empty_state(ui);
                 return;
             }
 
@@ -430,6 +512,34 @@ impl App {
                 }
             }
         }
+    }
+
+    fn render_empty_state(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(48.0);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                egui::RichText::new("No Wiimote known yet")
+                    .heading()
+                    .weak(),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                "Click the button below and press 1+2 on the Wiimote, \
+                 or pair manually via your OS Bluetooth settings.",
+            );
+            ui.add_space(14.0);
+            let scanning = self.scan_active_until.is_some_and(|t| {
+                t.checked_duration_since(std::time::Instant::now()).is_some()
+            });
+            ui.add_enabled_ui(!scanning, |ui| {
+                if ui
+                    .add(egui::Button::new("Scan for new devices (30 s)"))
+                    .clicked()
+                {
+                    self.daemon.send_command(UiCommand::StartScan);
+                }
+            });
+        });
     }
 
     fn render_modals(&mut self, ctx: &egui::Context) {
@@ -468,6 +578,10 @@ impl App {
                 self.modals.pending_forget = None;
             }
         }
+
+        // About dialog (Help → About WiiPair…).
+        if self.modals.about_open && dialogs::about_dialog(ctx) {
+            self.modals.about_open = false;
+        }
     }
 }
-

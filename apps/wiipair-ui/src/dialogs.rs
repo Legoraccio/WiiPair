@@ -115,7 +115,12 @@ fn render_uinput_unavailable(ui: &mut egui::Ui) {
     );
 }
 
-fn open_url(url: &str) {
+/// Open `url` in the user's default browser. Best-effort: if the
+/// platform helper isn't installed (xdg-open missing on minimal
+/// Linux setups, etc.) we silently degrade — there's nowhere
+/// useful to surface a "couldn't spawn xdg-open" message in this
+/// flow.
+pub fn open_url(url: &str) {
     #[cfg(target_os = "windows")]
     let _ = std::process::Command::new("cmd")
         .args(["/C", "start", "", url])
@@ -124,6 +129,75 @@ fn open_url(url: &str) {
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(url).spawn();
+}
+
+/// Repository home — used by the menu bar's "Open repository" entry
+/// and as the canonical link inside the About dialog.
+pub const REPO_URL: &str = "https://github.com/Legoraccio/WiiPair";
+/// Direct deep-link to the new-issue form, opened by Help → Report
+/// an issue.
+pub const ISSUES_URL: &str = "https://github.com/Legoraccio/WiiPair/issues";
+/// Releases page used by Help → Latest releases.
+pub const RELEASES_URL: &str = "https://github.com/Legoraccio/WiiPair/releases";
+
+/// Modal "About WiiPair" dialog. Returns true once the user dismisses
+/// it so `App` can clear the open flag.
+pub fn about_dialog(ctx: &egui::Context) -> bool {
+    let mut close = false;
+    egui::Window::new("About WiiPair")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            ui.set_min_width(380.0);
+            ui.vertical_centered(|ui| {
+                ui.add_space(4.0);
+                ui.heading("WiiPair");
+                ui.label(
+                    egui::RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION")))
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    "Bridges Bluetooth Wii controllers to virtual Xbox 360 \
+                     pads on the desktop, so XInput-aware games see them as \
+                     standard controllers.",
+                );
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+                if ui
+                    .link(egui::RichText::new(REPO_URL).monospace())
+                    .on_hover_text("Open the WiiPair repository on GitHub")
+                    .clicked()
+                {
+                    open_url(REPO_URL);
+                }
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    if ui.link("Releases").clicked() {
+                        open_url(RELEASES_URL);
+                    }
+                    ui.label("·");
+                    if ui.link("Report an issue").clicked() {
+                        open_url(ISSUES_URL);
+                    }
+                });
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("License: MIT")
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(10.0);
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            });
+        });
+    close
 }
 
 /// Recovery instructions when a BT pair attempt is wedged inside the

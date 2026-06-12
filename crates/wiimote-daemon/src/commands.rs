@@ -13,9 +13,10 @@ use wiimote_transport::{DeviceId, Transport};
 
 use crate::helpers::short_id;
 use crate::hid_scan::try_connect;
+use crate::user_msg::UserFacingError;
 use crate::{
     DaemonCtx, IDENTIFY_RUMBLE_MS, LogLevel, MANUAL_SCAN_DURATION, OUTPUT_RETRY_INTERVAL,
-    RETRY_INTERVAL, UiCommand, UiEvent, log_event,
+    RETRY_INTERVAL, UiCommand, UiEvent, clear_persistent_warning, emit_user_error, log_event,
 };
 
 pub(crate) fn handle_command(
@@ -61,12 +62,13 @@ fn handle_set_profile(
                     r.output = Some(out);
                     r.snapshot.last_error = None;
                 }
+                clear_persistent_warning(events_tx, "profile_rebuild");
             }
             Err(e) => {
                 debug!("output rebuild failed: {e}");
                 if let Some(r) = ctx.registry.get_mut(&id) {
                     r.snapshot.last_error =
-                        Some("Could not rebuild virtual gamepad with new profile".into());
+                        Some(UserFacingError::ProfileRebuildFailed.message());
                     r.output_retry_at = Some(Instant::now() + OUTPUT_RETRY_INTERVAL);
                 }
             }
@@ -94,20 +96,59 @@ fn handle_connect(
         LogLevel::Info,
         format!("connect requested: {}", short_id(&id)),
     ));
-    if !try_connect(&id, ctx, hid, events_tx) {
-        if let Some(r) = ctx.registry.get_mut(&id) {
-            r.next_retry = Some(Instant::now() + RETRY_INTERVAL);
-        }
-        let _ = events_tx.send(log_event(
-            LogLevel::Warn,
-            format!(
-                "{} not reachable via HID. Windows hasn't activated the HID profile \
-                 for this device. Try: unpair from Bluetooth settings, then click \
-                 'Scan for new devices' here and press 1+2 on the Wiimote.",
-                short_id(&id)
-            ),
-        ));
+    if try_connect(&id, ctx, hid, events_tx) {
+        ctx.dirty = true;
+        return;
     }
+
+    // Direct HID open failed. Schedule a normal auto-retry…
+    if let Some(r) = ctx.registry.get_mut(&id) {
+        r.next_retry = Some(Instant::now() + RETRY_INTERVAL);
+    }
+    // …and *also* open a 30 s manual-scan window if one isn't already
+    // active. The window has two effects that matter for an explicit
+    // user-initiated `Connect`:
+    //
+    //   1. The Bluetooth scanner stops being paused (see the
+    //      `pause_inquiry` flag in `lib.rs::run`) and starts running
+    //      inquiries again. On Windows that triggers the
+    //      `BluetoothSetServiceState(HID_SERVICE_GUID, ENABLE)` call
+    //      that reactivates the HID profile for paired-but-offline
+    //      Wiimotes.
+    //   2. It opens the gate on `handle_bt_state_stuck`, so a Wii
+    //      Remote Plus that surfaces a stale SDP cache mid-flow
+    //      auto-depairs and the next inquiry re-pairs it from
+    //      scratch (provided the user holds 1+2).
+    //
+    // Skipped if a scan window is already active — don't reset its
+    // deadline mid-flight.
+    let opened_scan = if ctx.manual_scan_until.is_none() {
+        let until = Instant::now() + MANUAL_SCAN_DURATION;
+        ctx.manual_scan_until = Some(until);
+        ctx.force_rescan = true;
+        let _ = events_tx.send(UiEvent::ScanState {
+            active_until: Some(until),
+        });
+        true
+    } else {
+        false
+    };
+
+    let hint = if opened_scan {
+        format!(
+            "{} not reachable yet — opened a {}s scan window. Hold 1+2 on \
+             the Wiimote so the OS can re-bind it; this also auto-recovers \
+             Wii Remote Plus units that get stuck on a stale SDP cache.",
+            short_id(&id),
+            MANUAL_SCAN_DURATION.as_secs(),
+        )
+    } else {
+        format!(
+            "{} not reachable via HID — auto-retry will keep trying.",
+            short_id(&id),
+        )
+    };
+    let _ = events_tx.send(log_event(LogLevel::Warn, hint));
     ctx.dirty = true;
 }
 
@@ -134,6 +175,9 @@ fn handle_disconnect(
         r.reset_session();
         r.snapshot.user_disabled = true;
     }
+    // Disconnecting frees an XInput slot, so the "4 Wiimotes
+    // already connected" banner — if it was up — no longer applies.
+    clear_persistent_warning(events_tx, "slot_cap");
     let _ = events_tx.send(log_event(
         LogLevel::Info,
         format!(
@@ -170,21 +214,25 @@ fn handle_forget(
     if let Some(addr) = mac_to_u64(&id) {
         match unpair_addr(addr) {
             Ok(()) => {
+                clear_persistent_warning(events_tx, "os_unpair");
                 let _ = events_tx.send(log_event(
                     LogLevel::Info,
                     format!("unpaired {} from OS", short_id(&id)),
                 ));
             }
             Err(e) => {
-                let _ = events_tx.send(log_event(
-                    LogLevel::Warn,
-                    format!("OS unpair failed: {e}"),
-                ));
+                emit_user_error(
+                    events_tx,
+                    UserFacingError::OsUnpairFailed { id: id.clone() },
+                    format!("OS unpair failed for {}: {e}", short_id(&id)),
+                );
             }
         }
     }
 
     if let Some(r) = removed {
+        // Forgetting a device frees its XInput slot if it had one.
+        clear_persistent_warning(events_tx, "slot_cap");
         let _ = events_tx.send(log_event(
             LogLevel::Info,
             format!("forgot: {} ({})", r.snapshot.name, short_id(&id)),

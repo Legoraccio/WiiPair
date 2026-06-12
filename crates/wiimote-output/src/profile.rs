@@ -134,6 +134,7 @@ mod tests {
         ExtensionData::Nunchuk(NunchukState {
             stick_x: 128,
             stick_y: 128,
+            accel: wiimote_core::Accelerometer { x: 512, y: 512, z: 612 },
             c: false,
             z: false,
         })

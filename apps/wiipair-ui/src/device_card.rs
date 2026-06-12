@@ -1,21 +1,16 @@
 //! Per-device row layout — header (name + buttons), live-state body
-//! (Wiimote zone + extension zone), footer (battery + accel + IR).
+//! (Wiimote zone + extension zone + Xbox 360 preview), footer
+//! (battery + accel + IR + profile).
 
 use crossbeam_channel::Sender;
 use eframe::egui;
-use wiimote_core::{
-    Buttons, ClassicButtons, ClassicState, DrumsButtons, DrumsState, ExtensionData, GuitarButtons,
-    GuitarState, NunchukState,
-};
+use wiimote_core::ExtensionData;
 use wiimote_daemon::{DeviceSnapshot, UiCommand};
-use wiimote_output::MappingProfile;
+use wiimote_output::{ControllerState, MappingProfile, map_to_xbox};
 
+use crate::device_widgets;
 use crate::icons::{draw_device_icon, extension_color};
-use crate::widgets::{
-    arrow_indicator, battery_widget, button_indicator, fret_indicator, ir_widget, pad_indicator,
-    pm_indicator, strum_indicator, tilt_widget, whammy_bar, ArrowDir, BASS_COLOR, FRET_BLUE,
-    FRET_GREEN, FRET_ORANGE, FRET_RED, FRET_YELLOW,
-};
+use crate::widgets::{battery_widget, ir_widget, tilt_widget};
 
 pub fn render_device(ui: &mut egui::Ui, d: &DeviceSnapshot, tx: &Sender<UiCommand>) {
     ui.group(|ui| {
@@ -58,12 +53,23 @@ fn render_header(ui: &mut egui::Ui, d: &DeviceSnapshot, tx: &Sender<UiCommand>) 
         ui.with_layout(
             egui::Layout::right_to_left(egui::Align::Center),
             |ui| {
-                if d.connected {
-                    if ui.button("Disconnect").clicked() {
-                        let _ = tx.send(UiCommand::Disconnect(d.id.clone()));
-                    }
-                } else if ui.button("Connect").clicked() {
-                    let _ = tx.send(UiCommand::Connect(d.id.clone()));
+                // Right-to-left order: Forget (danger) ← separator ←
+                // Identify ← primary (Connect/Disconnect). Reading
+                // left-to-right on screen this becomes
+                // primary | Identify | Forget — primary action first,
+                // destructive last.
+                let danger = egui::Button::new(
+                    egui::RichText::new("Forget").color(egui::Color32::WHITE),
+                )
+                .fill(egui::Color32::from_rgb(150, 60, 60));
+                if ui
+                    .add(danger)
+                    .on_hover_text(
+                        "Disconnect, remove from the saved list and unpair from the OS Bluetooth registry.",
+                    )
+                    .clicked()
+                {
+                    let _ = tx.send(UiCommand::Forget(d.id.clone()));
                 }
                 let identify_btn =
                     ui.add_enabled(d.connected, egui::Button::new("Identify"));
@@ -73,65 +79,100 @@ fn render_header(ui: &mut egui::Ui, d: &DeviceSnapshot, tx: &Sender<UiCommand>) 
                 {
                     let _ = tx.send(UiCommand::Identify(d.id.clone()));
                 }
-                if ui
-                    .button("Forget")
-                    .on_hover_text(
-                        "Disconnect, remove from the saved list and unpair from the OS Bluetooth registry.",
-                    )
-                    .clicked()
-                {
-                    let _ = tx.send(UiCommand::Forget(d.id.clone()));
+                ui.separator();
+                if d.connected {
+                    if ui.button("Disconnect").clicked() {
+                        let _ = tx.send(UiCommand::Disconnect(d.id.clone()));
+                    }
+                } else if ui.button("Connect").clicked() {
+                    let _ = tx.send(UiCommand::Connect(d.id.clone()));
                 }
             },
         );
+    });
+
+    // Inline warning chip — only shown when the daemon attached a
+    // user-facing error to this device. The string is always a
+    // pre-formatted UserFacingError message (no raw {e}).
+    if let Some(err) = &d.last_error {
+        render_error_chip(ui, err);
+    }
+}
+
+fn render_error_chip(ui: &mut egui::Ui, message: &str) {
+    let frame = egui::Frame::none()
+        .fill(egui::Color32::from_rgb(60, 30, 30))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(170, 80, 80)))
+        .rounding(egui::Rounding::same(4.0))
+        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+        .outer_margin(egui::Margin::symmetric(0.0, 2.0));
+    frame.show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.colored_label(egui::Color32::from_rgb(255, 170, 170), "⚠");
+            ui.colored_label(egui::Color32::from_rgb(255, 220, 220), message);
+        });
     });
 }
 
 fn render_body(ui: &mut egui::Ui, d: &DeviceSnapshot) {
     ui.horizontal(|ui| {
-        // Zone 1 — primary device (Wii Remote).
+        // Zone 1 — primary device (Wii Remote) painted as a stylised
+        // silhouette with live button highlights.
         ui.vertical(|ui| {
             ui.label(egui::RichText::new("Wii Remote").small().weak());
-            render_wiimote_zone(ui, d);
+            device_widgets::paint_wiimote(ui, d);
         });
 
         ui.separator();
 
-        // Zone 2 — connected extension (or "no extension").
+        // Zone 2 — connected extension. Same pictographic style as the
+        // Wiimote zone for visual consistency across the row.
         ui.vertical(|ui| match (&d.ext_data, d.extension) {
             (Some(ExtensionData::Guitar(g)), _) => {
                 ui.label(egui::RichText::new("Guitar (GH/RB)").small().weak());
-                render_guitar_zone(ui, g);
+                device_widgets::paint_guitar(ui, g);
             }
             (Some(ExtensionData::Drums(dr)), _) => {
                 ui.label(egui::RichText::new("Drums (GH/RB)").small().weak());
-                render_drums_zone(ui, dr);
+                device_widgets::paint_drums(ui, dr);
             }
             (Some(ExtensionData::Nunchuk(n)), _) => {
                 ui.label(egui::RichText::new("Nunchuk").small().weak());
-                render_nunchuk_zone(ui, n);
+                device_widgets::paint_nunchuk(ui, n);
             }
             (Some(ExtensionData::Classic(c)), _) => {
                 ui.label(egui::RichText::new("Classic Controller").small().weak());
-                render_classic_zone(ui, c);
+                device_widgets::paint_classic(ui, c);
             }
             (Some(ExtensionData::Unparsed), Some(t)) => {
-                ui.label(
-                    egui::RichText::new(format!("{} — no parser yet", t.label()))
-                        .small()
-                        .weak(),
-                );
+                ui.label(egui::RichText::new(t.label()).small().weak());
+                device_widgets::paint_no_extension(ui, "no parser yet");
             }
             (None, Some(t)) => {
-                ui.label(
-                    egui::RichText::new(format!("{} (offline)", t.label()))
-                        .small()
-                        .weak(),
-                );
+                ui.label(egui::RichText::new(t.label()).small().weak());
+                device_widgets::paint_no_extension(ui, "offline");
             }
             (None, None) | (_, None) => {
                 ui.label(egui::RichText::new("No extension").small().weak());
+                device_widgets::paint_no_extension(ui, "—");
             }
+        });
+
+        // Zone 3 — Xbox 360 mapping preview, anchored to the right
+        // edge so the user can see the live result of the active
+        // mapping profile alongside the source inputs.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new("Xbox 360 output").small().weak());
+                let cs = ControllerState {
+                    buttons: d.last_buttons,
+                    accel: d.last_accel,
+                    ir: d.last_ir,
+                    ext: d.ext_data,
+                };
+                let xb = map_to_xbox(d.mapping_profile, &cs);
+                crate::xbox_widget::render(ui, &xb);
+            });
         });
     });
 }
@@ -149,9 +190,9 @@ fn render_footer(ui: &mut egui::Ui, d: &DeviceSnapshot, tx: &crossbeam_channel::
         ui.separator();
         render_profile_selector(ui, d, tx);
     });
-    if let Some(err) = &d.last_error {
-        ui.colored_label(egui::Color32::LIGHT_RED, err);
-    }
+    // `last_error` is rendered as an inline chip above (right under
+    // the device header) — keeping it close to the device name puts
+    // it where the user is already looking when something is wrong.
 }
 
 fn render_profile_selector(
@@ -174,197 +215,6 @@ fn render_profile_selector(
             profile: chosen,
         });
     }
-}
-
-// =====================================================================
-// Wiimote / extension zones
-// =====================================================================
-
-fn render_wiimote_zone(ui: &mut egui::Ui, d: &DeviceSnapshot) {
-    ui.horizontal(|ui| {
-        // D-pad in physical 3-row arrangement.
-        ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                ui.add_space(30.0);
-                arrow_indicator(ui, ArrowDir::Up, d.last_buttons.contains(Buttons::UP));
-            });
-            ui.horizontal(|ui| {
-                arrow_indicator(ui, ArrowDir::Left, d.last_buttons.contains(Buttons::LEFT));
-                ui.add_space(2.0);
-                arrow_indicator(ui, ArrowDir::Right, d.last_buttons.contains(Buttons::RIGHT));
-            });
-            ui.horizontal(|ui| {
-                ui.add_space(30.0);
-                arrow_indicator(ui, ArrowDir::Down, d.last_buttons.contains(Buttons::DOWN));
-            });
-        });
-
-        ui.add_space(6.0);
-
-        // A button (large), B (trigger).
-        ui.vertical(|ui| {
-            button_indicator(
-                ui,
-                "A",
-                d.last_buttons.contains(Buttons::A),
-                egui::Color32::from_rgb(80, 220, 80),
-            );
-            button_indicator(
-                ui,
-                "B",
-                d.last_buttons.contains(Buttons::B),
-                egui::Color32::from_rgb(220, 90, 90),
-            );
-        });
-
-        ui.add_space(6.0);
-
-        // 1, 2.
-        ui.vertical(|ui| {
-            button_indicator(
-                ui,
-                "1",
-                d.last_buttons.contains(Buttons::ONE),
-                egui::Color32::LIGHT_GRAY,
-            );
-            button_indicator(
-                ui,
-                "2",
-                d.last_buttons.contains(Buttons::TWO),
-                egui::Color32::LIGHT_GRAY,
-            );
-        });
-
-        ui.add_space(6.0);
-
-        // Plus / Home / Minus column.
-        ui.vertical(|ui| {
-            button_indicator(
-                ui,
-                "+",
-                d.last_buttons.contains(Buttons::PLUS),
-                egui::Color32::LIGHT_GRAY,
-            );
-            button_indicator(
-                ui,
-                "Home",
-                d.last_buttons.contains(Buttons::HOME),
-                egui::Color32::LIGHT_BLUE,
-            );
-            button_indicator(
-                ui,
-                "−",
-                d.last_buttons.contains(Buttons::MINUS),
-                egui::Color32::LIGHT_GRAY,
-            );
-        });
-    });
-}
-
-fn render_guitar_zone(ui: &mut egui::Ui, g: &GuitarState) {
-    ui.horizontal(|ui| {
-        for (flag, color, label) in [
-            (GuitarButtons::GREEN, FRET_GREEN, "G"),
-            (GuitarButtons::RED, FRET_RED, "R"),
-            (GuitarButtons::YELLOW, FRET_YELLOW, "Y"),
-            (GuitarButtons::BLUE, FRET_BLUE, "B"),
-            (GuitarButtons::ORANGE, FRET_ORANGE, "O"),
-        ] {
-            fret_indicator(ui, color, g.buttons.contains(flag), label);
-        }
-        ui.add_space(8.0);
-        strum_indicator(
-            ui,
-            g.buttons.contains(GuitarButtons::STRUM_UP),
-            g.buttons.contains(GuitarButtons::STRUM_DOWN),
-        );
-        ui.add_space(8.0);
-        whammy_bar(ui, g.whammy);
-        ui.add_space(8.0);
-        pm_indicator(
-            ui,
-            g.buttons.contains(GuitarButtons::PLUS),
-            g.buttons.contains(GuitarButtons::MINUS),
-        );
-    });
-}
-
-fn render_drums_zone(ui: &mut egui::Ui, dr: &DrumsState) {
-    ui.horizontal(|ui| {
-        for (flag, color, label) in [
-            (DrumsButtons::RED, FRET_RED, "R"),
-            (DrumsButtons::YELLOW, FRET_YELLOW, "Y"),
-            (DrumsButtons::BLUE, FRET_BLUE, "B"),
-            (DrumsButtons::GREEN, FRET_GREEN, "G"),
-            (DrumsButtons::ORANGE, FRET_ORANGE, "O"),
-        ] {
-            pad_indicator(ui, color, dr.buttons.contains(flag), label);
-        }
-        ui.add_space(8.0);
-        pad_indicator(
-            ui,
-            BASS_COLOR,
-            dr.buttons.contains(DrumsButtons::BASS_PEDAL),
-            "Bass",
-        );
-        ui.add_space(12.0);
-        pm_indicator(
-            ui,
-            dr.buttons.contains(DrumsButtons::PLUS),
-            dr.buttons.contains(DrumsButtons::MINUS),
-        );
-    });
-}
-
-fn render_nunchuk_zone(ui: &mut egui::Ui, n: &NunchukState) {
-    ui.horizontal(|ui| {
-        button_indicator(ui, "C", n.c, egui::Color32::from_rgb(180, 220, 180));
-        button_indicator(ui, "Z", n.z, egui::Color32::from_rgb(180, 220, 180));
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new(format!(
-                "stick: x={:>3}  y={:>3}",
-                n.stick_x, n.stick_y
-            ))
-            .monospace(),
-        );
-    });
-}
-
-fn render_classic_zone(ui: &mut egui::Ui, c: &ClassicState) {
-    ui.horizontal_wrapped(|ui| {
-        for (flag, name, color) in [
-            (ClassicButtons::A, "A", egui::Color32::from_rgb(80, 220, 80)),
-            (ClassicButtons::B, "B", egui::Color32::from_rgb(220, 80, 80)),
-            (ClassicButtons::X, "X", egui::Color32::from_rgb(80, 130, 220)),
-            (ClassicButtons::Y, "Y", egui::Color32::from_rgb(220, 200, 80)),
-            (ClassicButtons::ZL, "ZL", egui::Color32::LIGHT_GRAY),
-            (ClassicButtons::ZR, "ZR", egui::Color32::LIGHT_GRAY),
-            (ClassicButtons::LT, "L", egui::Color32::LIGHT_GRAY),
-            (ClassicButtons::RT, "R", egui::Color32::LIGHT_GRAY),
-            (ClassicButtons::PLUS, "+", egui::Color32::LIGHT_GRAY),
-            (ClassicButtons::MINUS, "−", egui::Color32::LIGHT_GRAY),
-            (ClassicButtons::HOME, "Home", egui::Color32::LIGHT_BLUE),
-        ] {
-            button_indicator(ui, name, c.buttons.contains(flag), color);
-        }
-        arrow_indicator(ui, ArrowDir::Up, c.buttons.contains(ClassicButtons::DPAD_UP));
-        arrow_indicator(
-            ui,
-            ArrowDir::Down,
-            c.buttons.contains(ClassicButtons::DPAD_DOWN),
-        );
-        arrow_indicator(
-            ui,
-            ArrowDir::Left,
-            c.buttons.contains(ClassicButtons::DPAD_LEFT),
-        );
-        arrow_indicator(
-            ui,
-            ArrowDir::Right,
-            c.buttons.contains(ClassicButtons::DPAD_RIGHT),
-        );
-    });
 }
 
 fn short_id(s: &str, max: usize) -> String {

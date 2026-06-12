@@ -11,8 +11,10 @@ use wiimote_transport::{DeviceId, DeviceInfo, Transport};
 
 use crate::helpers::short_id;
 use crate::state::DeviceRuntime;
+use crate::user_msg::UserFacingError;
 use crate::{
-    DaemonCtx, DeviceSnapshot, LogLevel, OUTPUT_RETRY_INTERVAL, RETRY_INTERVAL, UiEvent, log_event,
+    DaemonCtx, DeviceSnapshot, LogLevel, OUTPUT_RETRY_INTERVAL, RETRY_INTERVAL, UiEvent,
+    clear_persistent_warning, emit_user_error, log_event,
 };
 
 pub(crate) fn tick_periodic_scan(
@@ -213,12 +215,15 @@ pub(crate) fn promote_to_connected(
 ) {
     let Some(slot) = ctx.registry.lowest_free_slot() else {
         // 5th Wiimote refused (B4) — XInput supports at most 4.
-        let user_msg = "4 Wiimotes already connected — XInput supports at most 4. \
-                        Disconnect one before connecting another.";
+        let user_msg = UserFacingError::SlotCapReached.message();
         if let Some(r) = ctx.registry.get_mut(id) {
-            r.snapshot.last_error = Some(user_msg.into());
+            r.snapshot.last_error = Some(user_msg.clone());
         }
-        let _ = events_tx.send(log_event(LogLevel::Warn, user_msg));
+        emit_user_error(
+            events_tx,
+            UserFacingError::SlotCapReached,
+            format!("slot cap reached, refusing {}", short_id(id)),
+        );
         if let Some(r) = ctx.registry.get(id) {
             let _ = hid.close(&DeviceId(r.snapshot.path.clone()));
         }
@@ -261,6 +266,9 @@ pub(crate) fn promote_to_connected(
             if let Some(r) = ctx.registry.get_mut(id) {
                 r.output = Some(out);
             }
+            // Backend is alive — nothing left to warn about.
+            clear_persistent_warning(events_tx, "output_backend");
+            clear_persistent_warning(events_tx, "output_unsupported");
             let _ = events_tx.send(log_event(
                 LogLevel::Info,
                 format!("virtual gamepad ready for {} ({})", short_id(id), profile.label()),
@@ -270,19 +278,25 @@ pub(crate) fn promote_to_connected(
             // Technical detail (Win32 codes etc.) only goes to the
             // debug log; the UI sees a clean, actionable message.
             debug!("output init failed: {e}");
-            let user_msg = match cfg!(target_os = "windows") {
-                true => "Virtual controller output unavailable — install or restart ViGEmBus",
-                false => "Virtual controller output not implemented on this platform",
+            let kind = if cfg!(any(target_os = "windows", target_os = "linux")) {
+                UserFacingError::OutputBackendUnavailable
+            } else {
+                UserFacingError::OutputBackendUnsupported
             };
+            let user_msg = kind.message();
             if let Some(r) = ctx.registry.get_mut(id) {
-                r.snapshot.last_error = Some(user_msg.into());
+                r.snapshot.last_error = Some(user_msg.clone());
                 // Don't give up — ViGEmBus often comes back within a
                 // few seconds (driver restart, transient state on
                 // first ever connect). The retry tick clears the
                 // error once it succeeds.
                 r.output_retry_at = Some(Instant::now() + OUTPUT_RETRY_INTERVAL);
             }
-            let _ = events_tx.send(log_event(LogLevel::Warn, user_msg));
+            emit_user_error(
+                events_tx,
+                kind,
+                format!("output init failed for {}: {e}", short_id(id)),
+            );
         }
     }
 }
@@ -311,6 +325,11 @@ pub(crate) fn tick_output_retry(now: Instant, ctx: &mut DaemonCtx, events_tx: &S
                     r.snapshot.last_error = None;
                     ctx.dirty = true;
                 }
+                // ViGEmBus / uinput came back — drop the global
+                // banner along with the per-device chip we already
+                // cleared above.
+                clear_persistent_warning(events_tx, "output_backend");
+                clear_persistent_warning(events_tx, "output_unsupported");
                 let _ = events_tx.send(log_event(
                     LogLevel::Info,
                     format!(

@@ -165,13 +165,28 @@ fn wiimote_keys(state: &ControllerState) -> HashSet<KeyCode> {
     if b.contains(Buttons::HOME) {
         s.insert(keys::SPACE);
     }
-    // Nunchuk surfaces C/Z too.
+    // Nunchuk surfaces C/Z plus its analog stick. The stick maps to
+    // the same arrow keys the D-pad already covers — pushing both at
+    // once just produces the same key, no accidental keyup.
     if let Some(ExtensionData::Nunchuk(n)) = &state.ext {
         if n.c {
             s.insert(keys::KEY_C);
         }
         if n.z {
             s.insert(keys::KEY_S);
+        }
+        const STICK_THRESHOLD: i32 = 40; // ~30% deflection past centre 128
+        let dx = i32::from(n.stick_x) - 128;
+        let dy = i32::from(n.stick_y) - 128;
+        if dy > STICK_THRESHOLD {
+            s.insert(keys::ARROW_UP);
+        } else if dy < -STICK_THRESHOLD {
+            s.insert(keys::ARROW_DOWN);
+        }
+        if dx > STICK_THRESHOLD {
+            s.insert(keys::ARROW_RIGHT);
+        } else if dx < -STICK_THRESHOLD {
+            s.insert(keys::ARROW_LEFT);
         }
     }
     if let Some(ExtensionData::Classic(c)) = &state.ext {

@@ -11,6 +11,37 @@ pub const ACCEL_DEADZONE: i32 = 30;
 /// that angle.
 pub const ACCEL_RANGE: i32 = 220;
 
+/// Nunchuk analog stick rests around 128 on each axis (8-bit raw).
+pub const STICK_CENTER: i32 = 128;
+/// Dead-zone applied to the Nunchuk stick — Nintendo's part has a
+/// generous mechanical neutral that benefits from being silenced.
+pub const STICK_DEADZONE: i32 = 8;
+/// Effective stick travel either side of `STICK_CENTER`. The raw range
+/// is [0..=255] but real units rarely sweep past ~30..=225, so the
+/// scaled stick saturates a few px short of the mechanical extremes —
+/// good enough for full deflection in every game we tested.
+pub const STICK_RANGE: i32 = 95;
+
+/// Map a Nunchuk stick byte (0..=255, 128 ≈ neutral) to a virtual
+/// stick position in `i16`. Same shape as [`tilt_to_stick`]: dead-zone
+/// near the centre, then linear scaling to ±`i16::MAX` (with the
+/// asymmetric `i16::MIN+1` clamp on the negative side so the value
+/// never sits below the uinput-declared minimum).
+pub fn nunchuk_stick_to_axis(raw: u8) -> i16 {
+    let delta = i32::from(raw) - STICK_CENTER;
+    if delta.abs() < STICK_DEADZONE {
+        return 0;
+    }
+    let signed = if delta > 0 {
+        delta - STICK_DEADZONE
+    } else {
+        delta + STICK_DEADZONE
+    };
+    let span = (STICK_RANGE - STICK_DEADZONE).max(1);
+    let scaled = (signed * i32::from(i16::MAX)) / span;
+    scaled.clamp(i32::from(i16::MIN) + 1, i32::from(i16::MAX)) as i16
+}
+
 /// Map a 0..=31 whammy reading to a symmetric `i16` axis range
 /// (`-32767`..=`32767`). Symmetry matters because the Linux uinput
 /// backend declares the abs-axis range as `[-ABS_RANGE, +ABS_RANGE]`
@@ -104,5 +135,25 @@ mod tests {
     fn tilt_just_past_deadzone_is_small() {
         let v = tilt_to_stick(ACCEL_CENTER + ACCEL_DEADZONE + 1);
         assert!(v > 0 && v < 1000, "got {v}");
+    }
+
+    #[test]
+    fn nunchuk_stick_neutral_inside_deadzone() {
+        assert_eq!(nunchuk_stick_to_axis(128), 0);
+        assert_eq!(nunchuk_stick_to_axis(132), 0);
+        assert_eq!(nunchuk_stick_to_axis(124), 0);
+    }
+
+    #[test]
+    fn nunchuk_stick_full_deflection_saturates() {
+        // u8 saturates at 255 / 0; both should hit (a clamped) ±i16::MAX.
+        assert_eq!(nunchuk_stick_to_axis(255), i16::MAX);
+        assert_eq!(nunchuk_stick_to_axis(0), i16::MIN + 1);
+    }
+
+    #[test]
+    fn nunchuk_stick_just_past_deadzone_is_small() {
+        let v = nunchuk_stick_to_axis(128 + STICK_DEADZONE as u8 + 1);
+        assert!(v > 0 && v < 5000, "got {v}");
     }
 }

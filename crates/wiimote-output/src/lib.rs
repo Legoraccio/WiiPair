@@ -8,6 +8,7 @@
 
 mod mapping;
 mod profile;
+pub mod xbox;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -15,6 +16,7 @@ mod linux;
 mod macos;
 
 pub use profile::{MappingProfile, PadLayout};
+pub use xbox::{XboxState, map_to_xbox};
 
 use wiimote_core::{Accelerometer, Buttons, ExtensionData, IrDots};
 
@@ -117,12 +119,9 @@ pub fn output_for_profile(profile: MappingProfile) -> anyhow::Result<Box<dyn Out
 
 #[cfg(windows)]
 pub mod windows {
-    use super::{ControllerState, MappingProfile, Output, PadLayout};
-    use crate::mapping::{tilt_to_stick, whammy_to_axis};
+    use super::{ControllerState, MappingProfile, Output};
+    use crate::xbox::{XboxState, map_to_xbox};
     use vigem_client::{Client, TargetId, XButtons, XGamepad, Xbox360Wired};
-    use wiimote_core::{
-        Buttons, ClassicButtons, ClassicState, ExtensionData, GuitarButtons, GuitarState,
-    };
 
     pub struct ViGEmOutput {
         target: Xbox360Wired<Client>,
@@ -151,172 +150,48 @@ pub mod windows {
 
     impl Output for ViGEmOutput {
         fn update(&mut self, state: &ControllerState) -> anyhow::Result<()> {
-            let gamepad = match self.profile.resolve_pad(state.ext.as_ref()) {
-                PadLayout::Wiimote => wiimote_gamepad(state),
-                PadLayout::Guitar => match &state.ext {
-                    Some(ExtensionData::Guitar(g)) => guitar_gamepad(g, state),
-                    _ => wiimote_gamepad(state),
-                },
-                PadLayout::Drums => match &state.ext {
-                    Some(ExtensionData::Drums(d)) => drums_gamepad(d, state),
-                    _ => wiimote_gamepad(state),
-                },
-                PadLayout::Classic => match &state.ext {
-                    Some(ExtensionData::Classic(c)) => classic_gamepad(c, state),
-                    _ => wiimote_gamepad(state),
-                },
-            };
+            let xbox = map_to_xbox(self.profile, state);
             self.target
-                .update(&gamepad)
+                .update(&to_xgamepad(&xbox))
                 .map_err(|e| anyhow::anyhow!("vigem update: {e}"))?;
             Ok(())
         }
     }
 
-    fn classic_gamepad(c: &ClassicState, state: &ControllerState) -> XGamepad {
+    /// Translate the cross-platform [`XboxState`] into vigem-client's
+    /// [`XGamepad`]. Pure data shuffling — all the actual mapping
+    /// happens in `xbox::map_to_xbox`.
+    fn to_xgamepad(s: &XboxState) -> XGamepad {
         let mut raw: u16 = 0;
-        for (flag, xb) in [
-            (ClassicButtons::A, XButtons::A),
-            (ClassicButtons::B, XButtons::B),
-            (ClassicButtons::X, XButtons::X),
-            (ClassicButtons::Y, XButtons::Y),
-            (ClassicButtons::ZL, XButtons::LB),
-            (ClassicButtons::ZR, XButtons::RB),
-            (ClassicButtons::PLUS, XButtons::START),
-            (ClassicButtons::MINUS, XButtons::BACK),
-            (ClassicButtons::HOME, XButtons::GUIDE),
-            (ClassicButtons::DPAD_UP, XButtons::UP),
-            (ClassicButtons::DPAD_DOWN, XButtons::DOWN),
-            (ClassicButtons::DPAD_LEFT, XButtons::LEFT),
-            (ClassicButtons::DPAD_RIGHT, XButtons::RIGHT),
+        for (pressed, bit) in [
+            (s.a, XButtons::A),
+            (s.b, XButtons::B),
+            (s.x, XButtons::X),
+            (s.y, XButtons::Y),
+            (s.lb, XButtons::LB),
+            (s.rb, XButtons::RB),
+            (s.start, XButtons::START),
+            (s.back, XButtons::BACK),
+            (s.guide, XButtons::GUIDE),
+            (s.thumb_l, XButtons::LTHUMB),
+            (s.thumb_r, XButtons::RTHUMB),
+            (s.up, XButtons::UP),
+            (s.down, XButtons::DOWN),
+            (s.left, XButtons::LEFT),
+            (s.right, XButtons::RIGHT),
         ] {
-            if c.buttons.contains(flag) {
-                raw |= xb;
-            }
-        }
-        let _ = state; // Wiimote tilt is ignored when a Classic is plugged.
-        XGamepad {
-            buttons: XButtons { raw },
-            thumb_lx: 0,
-            thumb_ly: 0,
-            thumb_rx: 0,
-            thumb_ry: 0,
-            // Classic Controller has digital L/R triggers; map to full-range.
-            left_trigger: if c.buttons.contains(ClassicButtons::LT) {
-                255
-            } else {
-                0
-            },
-            right_trigger: if c.buttons.contains(ClassicButtons::RT) {
-                255
-            } else {
-                0
-            },
-        }
-    }
-
-    fn drums_gamepad(d: &wiimote_core::DrumsState, state: &ControllerState) -> XGamepad {
-        use wiimote_core::DrumsButtons;
-        let mut raw: u16 = 0;
-        // Xplorer drum layout: red→B, yellow→Y, blue→X, green→A,
-        // orange→LB (cymbal), bass→RB (kick).
-        for (flag, xb) in [
-            (DrumsButtons::GREEN, XButtons::A),
-            (DrumsButtons::RED, XButtons::B),
-            (DrumsButtons::BLUE, XButtons::X),
-            (DrumsButtons::YELLOW, XButtons::Y),
-            (DrumsButtons::ORANGE, XButtons::LB),
-            (DrumsButtons::BASS_PEDAL, XButtons::RB),
-            (DrumsButtons::PLUS, XButtons::START),
-            (DrumsButtons::MINUS, XButtons::BACK),
-        ] {
-            if d.buttons.contains(flag) {
-                raw |= xb;
-            }
-        }
-        if state.buttons.contains(Buttons::HOME) {
-            raw |= XButtons::GUIDE;
-        }
-        XGamepad {
-            buttons: XButtons { raw },
-            thumb_lx: 0,
-            thumb_ly: 0,
-            thumb_rx: 0,
-            thumb_ry: 0,
-            left_trigger: 0,
-            right_trigger: 0,
-        }
-    }
-
-    fn wiimote_gamepad(state: &ControllerState) -> XGamepad {
-        let mut raw: u16 = 0;
-        for (flag, xb) in [
-            (Buttons::A, XButtons::A),
-            (Buttons::B, XButtons::B),
-            (Buttons::ONE, XButtons::X),
-            (Buttons::TWO, XButtons::Y),
-            (Buttons::PLUS, XButtons::START),
-            (Buttons::MINUS, XButtons::BACK),
-            (Buttons::HOME, XButtons::GUIDE),
-            (Buttons::UP, XButtons::UP),
-            (Buttons::DOWN, XButtons::DOWN),
-            (Buttons::LEFT, XButtons::LEFT),
-            (Buttons::RIGHT, XButtons::RIGHT),
-        ] {
-            if state.buttons.contains(flag) {
-                raw |= xb;
+            if pressed {
+                raw |= bit;
             }
         }
         XGamepad {
             buttons: XButtons { raw },
-            thumb_lx: tilt_to_stick(i32::from(state.accel.x)),
-            thumb_ly: tilt_to_stick(i32::from(state.accel.y)),
-            thumb_rx: 0,
-            thumb_ry: 0,
-            left_trigger: 0,
-            right_trigger: 0,
+            thumb_lx: s.lx,
+            thumb_ly: s.ly,
+            thumb_rx: s.rx,
+            thumb_ry: s.ry,
+            left_trigger: s.lt,
+            right_trigger: s.rt,
         }
     }
-
-    /// Xplorer X360 guitar layout — the one Clone Hero auto-recognises:
-    /// frets onto face buttons, strum onto D-pad, whammy on RX.
-    fn guitar_gamepad(g: &GuitarState, state: &ControllerState) -> XGamepad {
-        let mut raw: u16 = 0;
-        for (flag, xb) in [
-            (GuitarButtons::GREEN, XButtons::A),
-            (GuitarButtons::RED, XButtons::B),
-            (GuitarButtons::YELLOW, XButtons::Y),
-            (GuitarButtons::BLUE, XButtons::X),
-            (GuitarButtons::ORANGE, XButtons::LB),
-            (GuitarButtons::STRUM_UP, XButtons::UP),
-            (GuitarButtons::STRUM_DOWN, XButtons::DOWN),
-            (GuitarButtons::PLUS, XButtons::START),
-            (GuitarButtons::MINUS, XButtons::BACK),
-        ] {
-            if g.buttons.contains(flag) {
-                raw |= xb;
-            }
-        }
-        // Wiimote's HOME button stays as the Xbox guide button so the
-        // user can always escape into Steam/CH menus.
-        if state.buttons.contains(Buttons::HOME) {
-            raw |= XButtons::GUIDE;
-        }
-
-        // Whammy: 5-bit (0 = released, 31 = fully pressed) → RX axis
-        // (-32768 = released, +32767 = fully pressed). This is what the
-        // real Xplorer guitar reports.
-        let thumb_rx = whammy_to_axis(g.whammy);
-
-        XGamepad {
-            buttons: XButtons { raw },
-            thumb_lx: 0,
-            thumb_ly: 0,
-            thumb_rx,
-            thumb_ry: 0,
-            left_trigger: 0,
-            right_trigger: 0,
-        }
-    }
-
 }

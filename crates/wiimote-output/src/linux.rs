@@ -21,13 +21,9 @@ use evdev::{
     UinputAbsSetup,
 };
 
-use crate::mapping::{tilt_to_stick, whammy_to_axis};
-use crate::profile::{MappingProfile, PadLayout};
+use crate::profile::MappingProfile;
+use crate::xbox::{XboxState, map_to_xbox};
 use crate::{ControllerState, Output};
-use wiimote_core::{
-    Buttons, ClassicButtons, ClassicState, DrumsButtons, DrumsState, ExtensionData, GuitarButtons,
-    GuitarState,
-};
 
 /// Microsoft Xbox 360 wired controller — the device games look for.
 const XBOX360_VID: u16 = 0x045E;
@@ -95,9 +91,8 @@ impl UinputOutput {
 
 impl Output for UinputOutput {
     fn update(&mut self, state: &ControllerState) -> anyhow::Result<()> {
-        let frame = build_frame(self.profile, state);
-        let events = frame.to_events();
-        self.device.emit(&events)?;
+        let xbox = map_to_xbox(self.profile, state);
+        self.device.emit(&xbox_to_events(&xbox))?;
         Ok(())
     }
 }
@@ -118,164 +113,38 @@ fn check_uinput_writable() -> Result<(), String> {
     }
 }
 
-// =====================================================================
-// Logical frame: the stable XInput-style state we then turn into evdev
-// events. Splitting "compute mapping" from "emit events" keeps the
-// per-profile logic straightforward.
-// =====================================================================
-
-#[derive(Default)]
-struct Frame {
-    a: bool,
-    b: bool,
-    x: bool,
-    y: bool,
-    lb: bool,
-    rb: bool,
-    select: bool,
-    start: bool,
-    guide: bool,
-    dup: bool,
-    ddown: bool,
-    dleft: bool,
-    dright: bool,
-    lx: i32,
-    ly: i32,
-    rx: i32,
-    ry: i32,
-    lt: i32,
-    rt: i32,
-}
-
-impl Frame {
-    fn to_events(&self) -> Vec<InputEvent> {
-        let mut ev = Vec::with_capacity(16);
-        let mut k = |key: Key, pressed: bool| {
-            ev.push(InputEvent::new(EventType::KEY, key.code(), pressed as i32))
-        };
-        k(Key::BTN_SOUTH, self.a);
-        k(Key::BTN_EAST, self.b);
-        k(Key::BTN_WEST, self.x);
-        k(Key::BTN_NORTH, self.y);
-        k(Key::BTN_TL, self.lb);
-        k(Key::BTN_TR, self.rb);
-        k(Key::BTN_SELECT, self.select);
-        k(Key::BTN_START, self.start);
-        k(Key::BTN_MODE, self.guide);
-        k(Key::BTN_DPAD_UP, self.dup);
-        k(Key::BTN_DPAD_DOWN, self.ddown);
-        k(Key::BTN_DPAD_LEFT, self.dleft);
-        k(Key::BTN_DPAD_RIGHT, self.dright);
-        for (axis, val) in [
-            (AbsoluteAxisType::ABS_X, self.lx),
-            (AbsoluteAxisType::ABS_Y, self.ly),
-            (AbsoluteAxisType::ABS_RX, self.rx),
-            (AbsoluteAxisType::ABS_RY, self.ry),
-            (AbsoluteAxisType::ABS_Z, self.lt),
-            (AbsoluteAxisType::ABS_RZ, self.rt),
-        ] {
-            ev.push(InputEvent::new(EventType::ABSOLUTE, axis.0, val));
-        }
-        ev
+/// Translate the cross-platform [`XboxState`] into the evdev event
+/// stream uinput consumes. Pure data shuffling — all the actual
+/// mapping logic is in `xbox::map_to_xbox`.
+fn xbox_to_events(s: &XboxState) -> Vec<InputEvent> {
+    let mut ev = Vec::with_capacity(22);
+    let mut k = |key: Key, pressed: bool| {
+        ev.push(InputEvent::new(EventType::KEY, key.code(), pressed as i32))
+    };
+    k(Key::BTN_SOUTH, s.a);
+    k(Key::BTN_EAST, s.b);
+    k(Key::BTN_WEST, s.x);
+    k(Key::BTN_NORTH, s.y);
+    k(Key::BTN_TL, s.lb);
+    k(Key::BTN_TR, s.rb);
+    k(Key::BTN_SELECT, s.back);
+    k(Key::BTN_START, s.start);
+    k(Key::BTN_MODE, s.guide);
+    k(Key::BTN_THUMBL, s.thumb_l);
+    k(Key::BTN_THUMBR, s.thumb_r);
+    k(Key::BTN_DPAD_UP, s.up);
+    k(Key::BTN_DPAD_DOWN, s.down);
+    k(Key::BTN_DPAD_LEFT, s.left);
+    k(Key::BTN_DPAD_RIGHT, s.right);
+    for (axis, val) in [
+        (AbsoluteAxisType::ABS_X, i32::from(s.lx)),
+        (AbsoluteAxisType::ABS_Y, i32::from(s.ly)),
+        (AbsoluteAxisType::ABS_RX, i32::from(s.rx)),
+        (AbsoluteAxisType::ABS_RY, i32::from(s.ry)),
+        (AbsoluteAxisType::ABS_Z, i32::from(s.lt)),
+        (AbsoluteAxisType::ABS_RZ, i32::from(s.rt)),
+    ] {
+        ev.push(InputEvent::new(EventType::ABSOLUTE, axis.0, val));
     }
+    ev
 }
-
-fn build_frame(profile: MappingProfile, state: &ControllerState) -> Frame {
-    match profile.resolve_pad(state.ext.as_ref()) {
-        PadLayout::Wiimote => wiimote_frame(state),
-        PadLayout::Guitar => match &state.ext {
-            Some(ExtensionData::Guitar(g)) => guitar_frame(g, state),
-            _ => wiimote_frame(state),
-        },
-        PadLayout::Drums => match &state.ext {
-            Some(ExtensionData::Drums(d)) => drums_frame(d, state),
-            _ => wiimote_frame(state),
-        },
-        PadLayout::Classic => match &state.ext {
-            Some(ExtensionData::Classic(c)) => classic_frame(c, state),
-            _ => wiimote_frame(state),
-        },
-    }
-}
-
-fn wiimote_frame(state: &ControllerState) -> Frame {
-    let b = state.buttons;
-    Frame {
-        a: b.contains(Buttons::A),
-        b: b.contains(Buttons::B),
-        x: b.contains(Buttons::ONE),
-        y: b.contains(Buttons::TWO),
-        start: b.contains(Buttons::PLUS),
-        select: b.contains(Buttons::MINUS),
-        guide: b.contains(Buttons::HOME),
-        dup: b.contains(Buttons::UP),
-        ddown: b.contains(Buttons::DOWN),
-        dleft: b.contains(Buttons::LEFT),
-        dright: b.contains(Buttons::RIGHT),
-        lx: i32::from(tilt_to_stick(i32::from(state.accel.x))),
-        ly: i32::from(tilt_to_stick(i32::from(state.accel.y))),
-        ..Default::default()
-    }
-}
-
-fn guitar_frame(g: &GuitarState, state: &ControllerState) -> Frame {
-    Frame {
-        a: g.buttons.contains(GuitarButtons::GREEN),
-        b: g.buttons.contains(GuitarButtons::RED),
-        y: g.buttons.contains(GuitarButtons::YELLOW),
-        x: g.buttons.contains(GuitarButtons::BLUE),
-        lb: g.buttons.contains(GuitarButtons::ORANGE),
-        dup: g.buttons.contains(GuitarButtons::STRUM_UP),
-        ddown: g.buttons.contains(GuitarButtons::STRUM_DOWN),
-        start: g.buttons.contains(GuitarButtons::PLUS),
-        select: g.buttons.contains(GuitarButtons::MINUS),
-        guide: state.buttons.contains(Buttons::HOME),
-        rx: i32::from(whammy_to_axis(g.whammy)),
-        ..Default::default()
-    }
-}
-
-fn drums_frame(d: &DrumsState, state: &ControllerState) -> Frame {
-    Frame {
-        a: d.buttons.contains(DrumsButtons::GREEN),
-        b: d.buttons.contains(DrumsButtons::RED),
-        x: d.buttons.contains(DrumsButtons::BLUE),
-        y: d.buttons.contains(DrumsButtons::YELLOW),
-        lb: d.buttons.contains(DrumsButtons::ORANGE),
-        rb: d.buttons.contains(DrumsButtons::BASS_PEDAL),
-        start: d.buttons.contains(DrumsButtons::PLUS),
-        select: d.buttons.contains(DrumsButtons::MINUS),
-        guide: state.buttons.contains(Buttons::HOME),
-        ..Default::default()
-    }
-}
-
-fn classic_frame(c: &ClassicState, _state: &ControllerState) -> Frame {
-    Frame {
-        a: c.buttons.contains(ClassicButtons::A),
-        b: c.buttons.contains(ClassicButtons::B),
-        x: c.buttons.contains(ClassicButtons::X),
-        y: c.buttons.contains(ClassicButtons::Y),
-        lb: c.buttons.contains(ClassicButtons::ZL),
-        rb: c.buttons.contains(ClassicButtons::ZR),
-        lt: if c.buttons.contains(ClassicButtons::LT) {
-            TRIGGER_MAX
-        } else {
-            0
-        },
-        rt: if c.buttons.contains(ClassicButtons::RT) {
-            TRIGGER_MAX
-        } else {
-            0
-        },
-        start: c.buttons.contains(ClassicButtons::PLUS),
-        select: c.buttons.contains(ClassicButtons::MINUS),
-        guide: c.buttons.contains(ClassicButtons::HOME),
-        dup: c.buttons.contains(ClassicButtons::DPAD_UP),
-        ddown: c.buttons.contains(ClassicButtons::DPAD_DOWN),
-        dleft: c.buttons.contains(ClassicButtons::DPAD_LEFT),
-        dright: c.buttons.contains(ClassicButtons::DPAD_RIGHT),
-        ..Default::default()
-    }
-}
-
